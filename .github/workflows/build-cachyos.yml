@@ -16,22 +16,6 @@ on:
 permissions:
   contents: write
 
-# =============================================================
-# IMPORTANT:
-# Set these three values as GitHub Repository Secrets:
-#
-# SONIC_BASE_URL
-# SONIC_ARCHIVE_PREFIX
-# SONIC_ARCHIVE_PASSWORD
-#
-# Example:
-# SONIC_BASE_URL       = https://your-authorized-mirror.example/path
-# SONIC_ARCHIVE_PREFIX = Sonic.the.Hedgehog.XBOX360.PAL
-# SONIC_ARCHIVE_PASSWORD = your-password
-#
-# The workflow keeps the same BASE_URL / ARCHIVE_PREFIX /
-# ARCHIVE_PASSWORD interface as the original workflow.
-# =============================================================
 env:
   BASE_URL: ${{ secrets.SONIC_BASE_URL }}
   ARCHIVE_PREFIX: ${{ secrets.SONIC_ARCHIVE_PREFIX }}
@@ -47,7 +31,7 @@ jobs:
 
     steps:
 
-        # =========================================================
+      # =========================================================
       # 1. Dependencies
       # =========================================================
       - name: Install Dependencies
@@ -71,6 +55,9 @@ jobs:
             pkgconf \
             p7zip \
             curl \
+            zip \
+            unzip \
+            tar \
             file \
             binutils \
             ca-certificates \
@@ -80,20 +67,23 @@ jobs:
 
           echo
           echo "Installed tool versions:"
-
           git --version
-
-          CMAKE_VERSION="$(cmake --version)"
-          printf '%s\n' "${CMAKE_VERSION}"
-
+          cmake --version
           ninja --version
-
-          CLANG_VERSION="$(clang --version)"
-          printf '%s\n' "${CLANG_VERSION}"
+          clang --version
+          7z
 
           echo
-          echo "7-Zip version:"
-          7z
+          echo "Required executables:"
+          command -v git
+          command -v cmake
+          command -v ninja
+          command -v clang
+          command -v curl
+          command -v zip
+          command -v unzip
+          command -v tar
+          command -v 7z
 
           echo
           echo "Dependency installation completed successfully."
@@ -166,8 +156,8 @@ jobs:
           ls -lh /usr/local/bin/extract-xiso
 
           echo
-          echo "extract-xiso version:"
-          extract-xiso -v
+          echo "extract-xiso help:"
+          extract-xiso -h
 
       # =========================================================
       # 4. Validate download configuration
@@ -258,11 +248,7 @@ jobs:
               exit 1
             fi
 
-            MAGIC="$(
-              head -c 7 "${FILE}" |
-              od -An -tx1 |
-              tr -d ' \n'
-            )"
+            MAGIC="$(dd if="${FILE}" bs=1 count=7 2>/dev/null | od -An -tx1 | tr -d ' \n')"
 
             echo "part${i}: magic=${MAGIC}"
 
@@ -530,19 +516,16 @@ jobs:
           mkdir -p MarathonRecompLib/private
 
           echo "Copying default.xex..."
-
           install -m 0644 \
             "${DEFAULT_XEX}" \
             MarathonRecompLib/private/default.xex
 
           echo "Copying shader.arc..."
-
           install -m 0644 \
             "${SHADER_ARC}" \
             MarathonRecompLib/private/shader.arc
 
           echo "Copying shader_lt.arc..."
-
           install -m 0644 \
             "${SHADER_LT_ARC}" \
             MarathonRecompLib/private/shader_lt.arc
@@ -567,11 +550,9 @@ jobs:
           set -euo pipefail
 
           echo "Removing downloaded RAR volumes..."
-
           rm -rf sonic_raw
 
           echo "Removing extracted ISO..."
-
           if [[ -n "${ISO_FILE:-}" && -f "${ISO_FILE}" ]]; then
             rm -f "${ISO_FILE}"
           fi
@@ -585,10 +566,61 @@ jobs:
           ls -lh MarathonRecompLib/private
 
       # =========================================================
-      # 14. Configure using official project preset
+      # 14. Bootstrap vcpkg explicitly
+      # =========================================================
+      - name: Bootstrap vcpkg
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export VCPKG_ROOT="${GITHUB_WORKSPACE}/thirdparty/vcpkg"
+          export VCPKG_DISABLE_METRICS=1
+
+          echo "VCPKG_ROOT=${VCPKG_ROOT}"
+
+          if [[ ! -d "${VCPKG_ROOT}" ]]; then
+            echo "ERROR: VCPKG_ROOT directory does not exist."
+            exit 1
+          fi
+
+          if [[ ! -f "${VCPKG_ROOT}/bootstrap-vcpkg.sh" ]]; then
+            echo "ERROR: bootstrap-vcpkg.sh was not found."
+            exit 1
+          fi
+
+          command -v cmake
+          command -v ninja
+          command -v git
+          command -v curl
+          command -v zip
+          command -v unzip
+          command -v tar
+
+          cd "${VCPKG_ROOT}"
+
+          chmod +x bootstrap-vcpkg.sh
+
+          echo
+          echo "Bootstrapping vcpkg..."
+
+          ./bootstrap-vcpkg.sh -disableMetrics
+
+          if [[ ! -x "${VCPKG_ROOT}/vcpkg" ]]; then
+            echo "ERROR: vcpkg executable was not produced."
+            exit 1
+          fi
+
+          echo
+          echo "vcpkg version:"
+          "${VCPKG_ROOT}/vcpkg" version
+
+      # =========================================================
+      # 15. Configure using official project preset
       # =========================================================
       - name: Configure CMake
         shell: bash
+        env:
+          VCPKG_ROOT: ${{ github.workspace }}/thirdparty/vcpkg
         run: |
           set -euo pipefail
 
@@ -598,17 +630,29 @@ jobs:
           echo "${PRESET}"
 
           echo
+          echo "Verifying build tools:"
+          command -v cmake
+          command -v ninja
+          cmake --version
+          ninja --version
+
+          echo
           echo "Available CMake presets:"
           cmake --list-presets
 
           echo
+          echo "Verifying vcpkg:"
+          test -x "${VCPKG_ROOT}/vcpkg"
+          "${VCPKG_ROOT}/vcpkg" version
+
+          echo
           echo "Configuring..."
 
-          cmake . \
+          cmake \
             --preset "${PRESET}"
 
       # =========================================================
-      # 15. Build
+      # 16. Build
       # =========================================================
       - name: Build MarathonRecomp
         shell: bash
@@ -633,7 +677,7 @@ jobs:
             --parallel "$(nproc)"
 
       # =========================================================
-      # 16. Verify Linux Binary
+      # 17. Verify Linux Binary
       # =========================================================
       - name: Verify Linux Binary
         shell: bash
@@ -647,8 +691,8 @@ jobs:
             echo
             echo "Searching build output:"
             find "./out/build/${{ inputs.build_type }}" \
-              -type f \
               -maxdepth 6 \
+              -type f \
               -print
             exit 1
           fi
@@ -676,7 +720,7 @@ jobs:
           stat -c '%A %a %n' "${BIN}"
 
       # =========================================================
-      # 17. Create runnable CachyOS package
+      # 18. Create runnable CachyOS package
       # =========================================================
       - name: Package CachyOS Build
         shell: bash
@@ -777,7 +821,7 @@ jobs:
           du -sh "${PACKAGE_DIR}"
 
       # =========================================================
-      # 18. Create private full package containing game files
+      # 19. Create private full package containing game files
       # =========================================================
       - name: Package Full Private Build
         shell: bash
@@ -860,7 +904,7 @@ jobs:
             "Sonic-the-Hedgehog-2006-CachyOS-Full.tar.gz"
 
       # =========================================================
-      # 19. Public package
+      # 20. Public package
       # =========================================================
       - name: Create Public Release Package
         shell: bash
@@ -884,7 +928,7 @@ jobs:
             "Sonic-the-Hedgehog-2006-CachyOS.tar.gz"
 
       # =========================================================
-      # 20. Upload private full build as workflow artifact
+      # 21. Upload private full build as workflow artifact
       # =========================================================
       - name: Upload Full Build Artifact
         uses: actions/upload-artifact@v4
@@ -895,7 +939,7 @@ jobs:
           retention-days: 7
 
       # =========================================================
-      # 21. Upload public build artifact
+      # 22. Upload public build artifact
       # =========================================================
       - name: Upload Linux Build Artifact
         uses: actions/upload-artifact@v4
@@ -906,7 +950,7 @@ jobs:
           retention-days: 30
 
       # =========================================================
-      # 22. GitHub Release
+      # 23. GitHub Release
       # =========================================================
       - name: Release to GitHub
         uses: softprops/action-gh-release@v2
@@ -937,5 +981,3 @@ jobs:
 
             The workflow also produces a separate private workflow
             artifact containing the game files supplied to the build.
-
-            
