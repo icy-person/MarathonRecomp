@@ -1,4 +1,4 @@
-name: Build and Release Sonic CachyOS
+name: Build and Release Sonic CachyOS (Full Game)
 
 on:
   workflow_dispatch:
@@ -12,6 +12,16 @@ on:
           - linux-release
           - linux-relwithdebinfo
           - linux-debug
+      rar_parts:
+        description: Number of RAR parts to download
+        required: false
+        default: "8"
+        type: string
+      zstd_level:
+        description: zstd payload compression level (1-19)
+        required: false
+        default: "10"
+        type: string
 
 permissions:
   contents: write
@@ -20,10 +30,11 @@ env:
   BASE_URL: ${{ secrets.SONIC_BASE_URL }}
   ARCHIVE_PREFIX: ${{ secrets.SONIC_ARCHIVE_PREFIX }}
   ARCHIVE_PASSWORD: ${{ secrets.SONIC_ARCHIVE_PASSWORD }}
+  INSTALLER_NAME: Sonic-the-Hedgehog-2006-CachyOS-FULL-installer.run
 
 jobs:
   build:
-    name: Build & Release Sonic
+    name: Build & Release Sonic (Full Single-File)
     runs-on: ubuntu-24.04
 
     container:
@@ -37,28 +48,46 @@ jobs:
           pacman -Syu --noconfirm
           pacman -S --needed --noconfirm \
             base-devel git cmake ninja clang llvm lld \
-            gtk3 alsa-lib libpulse pipewire pkgconf p7zip \
+            gtk3 alsa-lib libpulse pipewire pkgconf p7zip unrar zstd \
             curl zip unzip tar file binutils ca-certificates zlib
+          pacman -Scc --noconfirm || true
           update-ca-trust
-          command -v git
-          command -v cmake
-          command -v ninja
-          command -v clang
-          command -v llvm-ar
-          command -v llvm-ranlib
-          command -v curl
-          command -v zip
-          command -v unzip
-          command -v tar
-          command -v 7z
-          llvm-ar --version
-          llvm-ranlib --version
+          for c in git cmake ninja clang llvm-ar llvm-ranlib curl tar zip unzip 7z unrar zstd; do
+            command -v "${c}" >/dev/null || { echo "ERROR: missing ${c}"; exit 1; }
+          done
+          zstd --version
 
       - name: Checkout MarathonRecomp
         uses: actions/checkout@v4
         with:
           submodules: recursive
           fetch-depth: 1
+
+      - name: Select Data Root (disk space)
+        id: dataroot
+        shell: bash
+        run: |
+          set -euo pipefail
+          NEED_KB=$((15 * 1024 * 1024))
+          CHOICE=""
+          for d in /mnt /var/tmp /tmp "${GITHUB_WORKSPACE}"; do
+            [ -d "${d}" ] || continue
+            [ -w "${d}" ] || continue
+            AVAIL_KB="$(df -Pk "${d}" | awk 'NR==2 {print $4}')"
+            echo "candidate ${d}: ${AVAIL_KB} KiB free"
+            if [ "${AVAIL_KB}" -ge "${NEED_KB}" ]; then
+              CHOICE="${d}"
+              break
+            fi
+          done
+          if [ -z "${CHOICE}" ]; then
+            CHOICE="${GITHUB_WORKSPACE}"
+            echo "WARNING: no location with >= 15 GiB free; using workspace." >&2
+          fi
+          mkdir -p "${CHOICE}/sonicdata"
+          echo "DATA_ROOT=${CHOICE}/sonicdata" >> "${GITHUB_ENV}"
+          echo "path=${CHOICE}/sonicdata" >> "${GITHUB_OUTPUT}"
+          df -h || true
 
       - name: Build extract-xiso
         shell: bash
@@ -71,7 +100,7 @@ jobs:
           EXTRACT_XISO_BIN="$(find /tmp/extract-xiso/build -type f -name 'extract-xiso' -perm -111 -print -quit)"
           [[ -n "${EXTRACT_XISO_BIN}" ]] || { echo "ERROR: extract-xiso executable was not produced."; exit 1; }
           install -Dm755 "${EXTRACT_XISO_BIN}" /usr/local/bin/extract-xiso
-          extract-xiso -h
+          extract-xiso -h || true
 
       - name: Validate Download Configuration
         shell: bash
@@ -83,13 +112,19 @@ jobs:
 
       - name: Download Sonic Xbox 360 Release
         shell: bash
+        env:
+          RAR_PARTS: ${{ inputs.rar_parts }}
         run: |
           set -euo pipefail
-          mkdir -p sonic_raw
-          for i in $(seq 1 8); do
+          if ! [[ "${RAR_PARTS:-}" =~ ^[0-9]+$ ]] || [ "${RAR_PARTS}" -lt 1 ]; then
+            RAR_PARTS=8
+          fi
+          RAW="${DATA_ROOT}/sonic_raw"
+          mkdir -p "${RAW}"
+          for i in $(seq 1 "${RAR_PARTS}"); do
             FILE="${ARCHIVE_PREFIX}.part${i}.rar"
             URL="${BASE_URL%/}/${FILE}"
-            OUTPUT="sonic_raw/${FILE}"
+            OUTPUT="${RAW}/${FILE}"
             curl --fail --location --retry 8 --retry-all-errors --retry-delay 5 \
               --connect-timeout 30 --max-time 1800 --continue-at - \
               --output "${OUTPUT}" "${URL}"
@@ -99,14 +134,19 @@ jobs:
 
       - name: Validate RAR Parts
         shell: bash
+        env:
+          RAR_PARTS: ${{ inputs.rar_parts }}
         run: |
           set -euo pipefail
-          for i in $(seq 1 8); do
-            FILE="sonic_raw/${ARCHIVE_PREFIX}.part${i}.rar"
+          if ! [[ "${RAR_PARTS:-}" =~ ^[0-9]+$ ]] || [ "${RAR_PARTS}" -lt 1 ]; then
+            RAR_PARTS=8
+          fi
+          for i in $(seq 1 "${RAR_PARTS}"); do
+            FILE="${DATA_ROOT}/sonic_raw/${ARCHIVE_PREFIX}.part${i}.rar"
             [[ -s "${FILE}" ]] || { echo "ERROR: Empty file: ${FILE}"; exit 1; }
             MAGIC="$(dd if="${FILE}" bs=1 count=7 2>/dev/null | od -An -tx1 | tr -d ' \n')"
             case "${MAGIC}" in
-              526172211a0700|526172211a070100) ;;
+              526172211a0700|526172211a0701) ;;
               *) echo "ERROR: Invalid RAR signature: ${FILE}"; file "${FILE}"; exit 1 ;;
             esac
           done
@@ -115,18 +155,24 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf extracted_assets
-          mkdir -p extracted_assets
-          FIRST_PART="sonic_raw/${ARCHIVE_PREFIX}.part1.rar"
-          7z x "${FIRST_PART}" "-oextracted_assets" "-p${ARCHIVE_PASSWORD}" -y
-          find extracted_assets -maxdepth 4 -type f -print > extracted_listing.txt
-          sed -n '1,200p' extracted_listing.txt
+          DEST="${DATA_ROOT}/extracted_assets"
+          rm -rf "${DEST}"
+          mkdir -p "${DEST}"
+          FIRST_PART="${DATA_ROOT}/sonic_raw/${ARCHIVE_PREFIX}.part1.rar"
+          if ! 7z x "${FIRST_PART}" "-o${DEST}" "-p${ARCHIVE_PASSWORD}" -y; then
+            echo "7z failed; retrying with unrar..." >&2
+            unrar x -p"${ARCHIVE_PASSWORD}" -o+ "${FIRST_PART}" "${DEST}/"
+          fi
+          # Free ~7 GiB immediately: the RAR parts are no longer needed.
+          rm -rf "${DATA_ROOT}/sonic_raw"
+          find "${DEST}" -maxdepth 4 -type f -print | sed -n '1,100p'
+          df -h "${DATA_ROOT}" || true
 
       - name: Locate Xbox 360 ISO
         shell: bash
         run: |
           set -euo pipefail
-          ISO_FILE="$(find extracted_assets -type f \( -iname '*.iso' -o -iname '*.xiso' \) -print -quit)"
+          ISO_FILE="$(find "${DATA_ROOT}/extracted_assets" -type f \( -iname '*.iso' -o -iname '*.xiso' \) -print -quit)"
           [[ -n "${ISO_FILE}" && -s "${ISO_FILE}" ]] || { echo "ERROR: No usable ISO/XISO image was found."; exit 1; }
           ls -lh "${ISO_FILE}"
           file "${ISO_FILE}"
@@ -136,30 +182,33 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          extract-xiso -l "${ISO_FILE}" > xiso_contents.txt
-          sed -n '1,250p' xiso_contents.txt
-          grep -Eiq 'default\.xex' xiso_contents.txt || echo "WARNING: default.xex was not found in the XISO listing."
-          grep -Eiq 'shader\.arc' xiso_contents.txt || echo "WARNING: shader.arc was not found in the XISO listing."
-          grep -Eiq 'shader_lt\.arc' xiso_contents.txt || echo "WARNING: shader_lt.arc was not found in the XISO listing."
+          extract-xiso -l "${ISO_FILE}" > "${DATA_ROOT}/xiso_contents.txt" || true
+          sed -n '1,100p' "${DATA_ROOT}/xiso_contents.txt"
+          grep -Eiq 'default\.xex' "${DATA_ROOT}/xiso_contents.txt" || echo "WARNING: default.xex was not found in the XISO listing."
+          grep -Eiq 'shader\.arc' "${DATA_ROOT}/xiso_contents.txt" || echo "WARNING: shader.arc was not found in the XISO listing."
 
       - name: Extract Xbox 360 Filesystem
         shell: bash
         run: |
           set -euo pipefail
-          rm -rf xbox360_game
-          mkdir -p xbox360_game
-          extract-xiso "${ISO_FILE}" -d xbox360_game
-          du -sh xbox360_game
-          find xbox360_game -type f -print > xbox360_listing.txt
-          sed -n '1,250p' xbox360_listing.txt
+          GAME_DIR_PATH="${DATA_ROOT}/xbox360_game"
+          rm -rf "${GAME_DIR_PATH}"
+          mkdir -p "${GAME_DIR_PATH}"
+          extract-xiso "${ISO_FILE}" -d "${GAME_DIR_PATH}"
+          # Free the ~7 GiB ISO: the extracted filesystem is what we ship.
+          rm -rf "${DATA_ROOT}/extracted_assets"
+          printf 'GAME_DIR=%s\n' "${GAME_DIR_PATH}" >> "${GITHUB_ENV}"
+          du -sh "${GAME_DIR_PATH}"
+          find "${GAME_DIR_PATH}" -maxdepth 2 -type f | sed -n '1,60p'
+          df -h "${DATA_ROOT}" || true
 
       - name: Locate Game Files
         shell: bash
         run: |
           set -euo pipefail
-          DEFAULT_XEX="$(find xbox360_game -type f -iname 'default.xex' -print -quit)"
-          SHADER_ARC="$(find xbox360_game -type f -iname 'shader.arc' -print -quit)"
-          SHADER_LT_ARC="$(find xbox360_game -type f -iname 'shader_lt.arc' -print -quit)"
+          DEFAULT_XEX="$(find "${GAME_DIR}" -type f -iname 'default.xex' -print -quit)"
+          SHADER_ARC="$(find "${GAME_DIR}" -type f -iname 'shader.arc' -print -quit)"
+          SHADER_LT_ARC="$(find "${GAME_DIR}" -type f -iname 'shader_lt.arc' -print -quit)"
           echo "default.xex   = ${DEFAULT_XEX:-NOT FOUND}"
           echo "shader.arc    = ${SHADER_ARC:-NOT FOUND}"
           echo "shader_lt.arc = ${SHADER_LT_ARC:-NOT FOUND}"
@@ -181,13 +230,6 @@ jobs:
           install -m 0644 "${SHADER_ARC}" MarathonRecompLib/private/shader.arc
           install -m 0644 "${SHADER_LT_ARC}" MarathonRecompLib/private/shader_lt.arc
 
-      - name: Cleanup Downloaded Archives
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf sonic_raw
-          rm -f "${ISO_FILE}"
-
       - name: Bootstrap vcpkg
         shell: bash
         run: |
@@ -196,13 +238,6 @@ jobs:
           export VCPKG_DISABLE_METRICS=1
           [[ -d "${VCPKG_ROOT}" ]] || exit 1
           [[ -f "${VCPKG_ROOT}/bootstrap-vcpkg.sh" ]] || exit 1
-          command -v cmake
-          command -v ninja
-          command -v git
-          command -v curl
-          command -v zip
-          command -v unzip
-          command -v tar
           cd "${VCPKG_ROOT}"
           chmod +x bootstrap-vcpkg.sh
           ./bootstrap-vcpkg.sh -disableMetrics
@@ -216,11 +251,6 @@ jobs:
         run: |
           set -euo pipefail
           PRESET="${{ inputs.build_type }}"
-          command -v cmake
-          command -v ninja
-          command -v clang
-          command -v llvm-ar
-          command -v llvm-ranlib
           test -x "${VCPKG_ROOT}/vcpkg"
           cmake --preset "${PRESET}" \
             -DCMAKE_AR=/usr/bin/llvm-ar \
@@ -247,173 +277,366 @@ jobs:
           [[ -f "${BIN}" ]] || { echo "ERROR: MarathonRecomp binary was not produced."; exit 1; }
           chmod +x "${BIN}"
           file "${BIN}"
-          readelf -h "${BIN}" | sed -n '1,25p'
+          readelf -h "${BIN}" | sed -n '1,20p'
+          if ldd "${BIN}" 2>/dev/null | grep -qi 'not found'; then
+            echo "ERROR: unresolved shared libraries:"
+            ldd "${BIN}" || true
+            exit 1
+          fi
           ldd "${BIN}" || true
 
-      - name: Build Single-File Installer
+      - name: Stage Binary and Free Scratch Space
         shell: bash
         run: |
           set -euo pipefail
+          PRESET="${{ inputs.build_type }}"
+          BIN="./out/build/${PRESET}/MarathonRecomp/MarathonRecomp"
+          [[ -f "${BIN}" ]] || { echo "ERROR: staged binary missing."; exit 1; }
+          STAGE="${DATA_ROOT}/stage"
+          rm -rf "${STAGE}"
+          mkdir -p "${STAGE}"
+          mv "${BIN}" "${STAGE}/MarathonRecomp"
+          chmod 0755 "${STAGE}/MarathonRecomp"
+          file "${STAGE}/MarathonRecomp"
+          # Free several GiB before packaging the ~7 GiB game payload.
+          rm -rf "${GITHUB_WORKSPACE}/out/build" || true
+          rm -rf "${GITHUB_WORKSPACE}/thirdparty/vcpkg/buildtrees" \
+                 "${GITHUB_WORKSPACE}/thirdparty/vcpkg/packages" || true
+          rm -rf "${GITHUB_WORKSPACE}/MarathonRecompLib/private" || true
+          df -h "${DATA_ROOT}" || true
 
-          STAGE="installer_stage"
-          WORK="installer_work"
-          INSTALLER="Sonic-the-Hedgehog-2006-CachyOS-installer.run"
-          BIN="./out/build/${{ inputs.build_type }}/MarathonRecomp/MarathonRecomp"
+      - name: Build Single-File Full-Game Installer
+        shell: bash
+        env:
+          ZSTD_LEVEL: ${{ inputs.zstd_level }}
+        run: |
+          set -euo pipefail
 
-          rm -rf "${STAGE}" "${WORK}" "${INSTALLER}"
-          mkdir -p "${STAGE}/payload" "${WORK}"
+          if ! [[ "${ZSTD_LEVEL:-}" =~ ^[0-9]+$ ]] || [ "${ZSTD_LEVEL}" -lt 1 ] || [ "${ZSTD_LEVEL}" -gt 19 ]; then
+            ZSTD_LEVEL=10
+          fi
+          echo "Using zstd level ${ZSTD_LEVEL}"
 
-          install -m 0755 "${BIN}" "${STAGE}/payload/MarathonRecomp"
-          install -m 0755 /usr/local/bin/extract-xiso "${STAGE}/payload/extract-xiso"
+          STAGE="${DATA_ROOT}/stage"
+          WORK="${DATA_ROOT}/installer_work"
+          INSTALLER="${DATA_ROOT}/${INSTALLER_NAME}"
 
-          cat > "${STAGE}/payload/install.sh" <<'INSTALL_SCRIPT'
+          rm -rf "${WORK}" "${INSTALLER}" "${DATA_ROOT}/SHA256SUMS.txt" "${DATA_ROOT}/installer_listing.txt"
+          mkdir -p "${WORK}"
+
+          install -m 0755 "${STAGE}/MarathonRecomp" "${WORK}/MarathonRecomp"
+          install -m 0755 /usr/local/bin/extract-xiso "${WORK}/extract-xiso"
+
+          cat > "${WORK}/run-sonic.sh" <<'LAUNCHER'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+          cd "${DIR}"
+          exec ./MarathonRecomp "$@"
+          LAUNCHER
+          chmod 0755 "${WORK}/run-sonic.sh"
+
+          touch "${WORK}/portable.txt"
+
+          cat > "${WORK}/README.txt" <<'README'
+          Sonic the Hedgehog (2006) - MarathonRecomp (CachyOS/Linux)
+          ==========================================================
+
+          COMPLETE, self-contained installation containing:
+            MarathonRecomp   Linux executable
+            run-sonic.sh     Launcher
+            portable.txt     Portable (relative) data paths
+            extract-xiso     XISO tool (kept for repairs)
+            game/            Complete Xbox 360 game filesystem
+
+          RUNNING
+            <install-dir>/run-sonic.sh
+            or: cd <install-dir> && ./MarathonRecomp
+
+          RUNTIME DEPENDENCIES (CachyOS/Arch)
+            sudo pacman -S --needed gtk3 alsa-lib libpulse pipewire mesa vulkan-icd-loader
+
+          GRAPHICS BACKEND (GNOME/Wayland problems)
+            <install-dir>/run-sonic.sh --sdl-video-driver wayland
+            <install-dir>/run-sonic.sh --sdl-video-driver x11
+          README
+
+          cat > "${WORK}/install.sh" <<'POST'
           #!/usr/bin/env bash
           set -euo pipefail
 
-          SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-          PREFIX="${HOME}/.local/share/MarathonRecomp"
-          BIN_DIR="${HOME}/.local/bin"
-          DESKTOP_DIR="${HOME}/.local/share/applications"
+          PREFIX="${1:?missing prefix}"
 
-          echo "Sonic the Hedgehog (2006) - MarathonRecomp"
-          echo
-          echo "Installation directory: ${PREFIX}"
-          echo
-
-          ISO="${1:-}"
-          if [[ -z "${ISO}" ]]; then
-            read -r -p "Path to your legally obtained Xbox 360 ISO/XISO: " ISO
+          if [ ! -f "${PREFIX}/game/default.xex" ]; then
+            echo "ERROR: ${PREFIX}/game/default.xex is missing; extraction failed." >&2
+            exit 1
           fi
 
-          [[ -n "${ISO}" ]] || { echo "ERROR: No ISO path supplied."; exit 1; }
-          [[ -f "${ISO}" ]] || { echo "ERROR: ISO file not found: ${ISO}"; exit 1; }
+          chmod 0755 "${PREFIX}/MarathonRecomp" \
+                     "${PREFIX}/run-sonic.sh" \
+                     "${PREFIX}/extract-xiso"
+          [ -f "${PREFIX}/portable.txt" ] || : > "${PREFIX}/portable.txt"
 
-          rm -rf "${PREFIX}"
-          mkdir -p "${PREFIX}/game" "${BIN_DIR}" "${DESKTOP_DIR}"
+          BIN_DIR="${HOME}/.local/bin"
+          DESKTOP_DIR="${HOME}/.local/share/applications"
+          mkdir -p "${BIN_DIR}" "${DESKTOP_DIR}"
 
-          install -m 0755 "${SCRIPT_DIR}/MarathonRecomp" "${PREFIX}/MarathonRecomp"
-          install -m 0755 "${SCRIPT_DIR}/extract-xiso" "${PREFIX}/extract-xiso"
+          ln -sfn "${PREFIX}/run-sonic.sh" "${BIN_DIR}/sonic2006"
 
-          echo
-          echo "Extracting the game filesystem from your ISO..."
-          "${PREFIX}/extract-xiso" "${ISO}" -d "${PREFIX}/game"
-
-          [[ -f "${PREFIX}/game/default.xex" ]] || {
-            echo "ERROR: default.xex was not found after ISO extraction."
-            rm -rf "${PREFIX}"
-            exit 1
-          }
-
-          cat > "${PREFIX}/run-sonic.sh" <<'LAUNCHER'
-          #!/usr/bin/env bash
-          set -euo pipefail
-          SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-          cd "${SCRIPT_DIR}"
-          exec "./MarathonRecomp" "$@"
-          LAUNCHER
-          chmod +x "${PREFIX}/run-sonic.sh"
-
-          ln -sfn "${PREFIX}/MarathonRecomp" "${BIN_DIR}/MarathonRecomp"
-
-          cat > "${DESKTOP_DIR}/MarathonRecomp.desktop" <<DESKTOP
+          cat > "${DESKTOP_DIR}/Sonic-2006-MarathonRecomp.desktop" <<DESKTOP
           [Desktop Entry]
           Type=Application
-          Name=Sonic the Hedgehog (2006) - MarathonRecomp
-          Comment=Sonic the Hedgehog (2006) recompiled for Linux
-          Exec=${PREFIX}/MarathonRecomp
+          Name=Sonic the Hedgehog (2006)
+          Comment=MarathonRecomp - recompiled for Linux
+          Exec=${PREFIX}/run-sonic.sh
           Path=${PREFIX}
           Terminal=false
           Categories=Game;
           DESKTOP
 
-          echo
-          echo "Installation complete."
-          echo "Game files: ${PREFIX}/game"
-          echo "Launcher: ${PREFIX}/run-sonic.sh"
-          echo "Desktop entry: ${DESKTOP_DIR}/MarathonRecomp.desktop"
-          echo
-          echo "Starting the game..."
-          exec "${PREFIX}/MarathonRecomp"
-          INSTALL_SCRIPT
+          command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "${DESKTOP_DIR}" || true
 
-          chmod +x "${STAGE}/payload/install.sh"
+          echo "Post-install setup OK."
+          POST
+          chmod 0755 "${WORK}/install.sh"
 
-          cat > "${STAGE}/README.txt" <<'README'
-          Sonic the Hedgehog (2006) - MarathonRecomp for CachyOS/Linux
-
-          This is a single-file installer.
-
-          Usage:
-            ./Sonic-the-Hedgehog-2006-CachyOS-installer.run
-
-          The installer contains the Linux executable and XISO extractor.
-          It does NOT contain original Sonic the Hedgehog game assets.
-
-          During installation, provide the path to your own legally obtained
-          Xbox 360 ISO/XISO image. The installer extracts the complete game
-          filesystem into:
-
-            ~/.local/share/MarathonRecomp/game
-
-          The launcher is installed at:
-
-            ~/.local/share/MarathonRecomp/run-sonic.sh
-          README
-
-          cp "${STAGE}/README.txt" "${WORK}/README.txt"
-          cp "${STAGE}/payload"/* "${WORK}/"
+          # Move (do not copy) the extracted game into the payload to save several GiB.
+          mv "${GAME_DIR}" "${WORK}/game"
+          [ -f "${WORK}/game/default.xex" ] || { echo "ERROR: game/default.xex missing."; exit 1; }
+          du -sh "${WORK}/game"
 
           cat > "${WORK}/stub" <<'STUB'
           #!/usr/bin/env bash
           set -euo pipefail
 
-          PAYLOAD_LINE=__PAYLOAD_LINE__
-          SELF="$(readlink -f "$0")"
-          TMP="$(mktemp -d)"
-          cleanup() { rm -rf "${TMP}"; }
-          trap cleanup EXIT
+          # Sonic the Hedgehog (2006) - MarathonRecomp
+          # Single-file self-extracting installer (shell stub + zstd/tar payload).
 
-          tail -n +"${PAYLOAD_LINE}" "${SELF}" | tar -xzf - -C "${TMP}"
-          exec "${TMP}/install.sh" "$@"
+          DEFAULT_PREFIX="${HOME}/.local/share/MarathonRecomp"
+          PREFIX="${SONIC_INSTALL_DIR:-${1:-${DEFAULT_PREFIX}}}"
+          PAYLOAD_LINE=__PAYLOAD_LINE__
+
+          SELF="$(readlink -f -- "$0")"
+          [ -r "${SELF}" ] || { echo "ERROR: cannot read ${SELF}" >&2; exit 1; }
+
+          command -v zstd >/dev/null 2>&1 || {
+            echo "ERROR: 'zstd' is required (preinstalled on Arch/CachyOS)." >&2
+            exit 1
+          }
+
+          if [ -e "${PREFIX}/game/default.xex" ]; then
+            if [ "${SONIC_YES:-}" = "1" ]; then
+              :
+            elif [ -t 0 ]; then
+              read -r -p "Existing installation found at ${PREFIX}. Overwrite? [y/N] " ans
+              case "${ans}" in
+                y|Y|yes|YES) ;;
+                *) echo "Aborted."; exit 1 ;;
+              esac
+            else
+              echo "ERROR: an installation already exists at ${PREFIX}." >&2
+              echo "Re-run in a terminal, or set SONIC_YES=1 to overwrite." >&2
+              exit 1
+            fi
+            rm -rf "${PREFIX}/game"
+          fi
+
+          mkdir -p "${PREFIX}"
+          echo "Installing to: ${PREFIX}"
+          echo "Extracting the complete game (this may take several minutes)..."
+
+          tail -n +"${PAYLOAD_LINE}" "${SELF}" | zstd -dc | tar -x -C "${PREFIX}"
+
+          bash "${PREFIX}/install.sh" "${PREFIX}"
+
+          echo
+          echo "=== Installation complete ==="
+          echo "Game files    : ${PREFIX}/game"
+          echo "Launcher      : ${PREFIX}/run-sonic.sh"
+          echo "Desktop entry : ${HOME}/.local/share/applications/Sonic-2006-MarathonRecomp.desktop"
+          echo
+
+          if [ -t 0 ]; then
+            read -r -p "Start the game now? [y/N] " ans
+            case "${ans}" in
+              y|Y|yes|YES)
+                cd "${PREFIX}"
+                exec ./run-sonic.sh
+                ;;
+            esac
+          fi
+
+          echo "Start later with: ${PREFIX}/run-sonic.sh"
+          exit 0
+          __PAYLOAD_MARKER__
           STUB
 
-          PAYLOAD_LINE="$(grep -n '^__PAYLOAD__$' "${WORK}/stub" | cut -d: -f1)"
-          (( PAYLOAD_LINE > 0 )) || { echo "ERROR: payload marker missing"; exit 1; }
-          PAYLOAD_LINE=$((PAYLOAD_LINE + 1))
+          MARKER_LINE="$(grep -n '^__PAYLOAD_MARKER__$' "${WORK}/stub" | cut -d: -f1)"
+          [ -n "${MARKER_LINE}" ] || { echo "ERROR: payload marker missing from stub."; exit 1; }
+          PAYLOAD_START="$((MARKER_LINE + 1))"
+          echo "Payload starts at line ${PAYLOAD_START}"
 
-          sed "s/^PAYLOAD_LINE=.*/PAYLOAD_LINE=${PAYLOAD_LINE}/" "${WORK}/stub" > "${INSTALLER}"
-          printf '\n__PAYLOAD__\n' >> "${INSTALLER}"
-          tar -czf - -C "${WORK}" install.sh MarathonRecomp extract-xiso README.txt >> "${INSTALLER}"
-          chmod +x "${INSTALLER}"
+          sed "s/__PAYLOAD_LINE__/${PAYLOAD_START}/" "${WORK}/stub" > "${INSTALLER}"
+          tar -cf - -C "${WORK}" \
+            install.sh README.txt portable.txt run-sonic.sh extract-xiso MarathonRecomp game \
+            | zstd -T0 -"${ZSTD_LEVEL}" >> "${INSTALLER}"
+          chmod 0755 "${INSTALLER}"
 
-          echo "Single-file installer created:"
+          echo "Verifying the embedded payload stream..."
+          tail -n +"${PAYLOAD_START}" "${INSTALLER}" | zstd -dc | tar -tf - > "${DATA_ROOT}/installer_listing.txt"
+          grep -qx 'game/default.xex' "${DATA_ROOT}/installer_listing.txt" \
+            || { echo "ERROR: payload integrity check failed."; exit 1; }
+          echo "Payload contains $(wc -l < "${DATA_ROOT}/installer_listing.txt") entries:"
+          sed -n '1,25p' "${DATA_ROOT}/installer_listing.txt"
+
+          ( cd "${DATA_ROOT}" && sha256sum "${INSTALLER_NAME}" > SHA256SUMS.txt )
+
+          rm -rf "${WORK}"
+
+          echo "Single-file full-game installer created:"
           ls -lh "${INSTALLER}"
           file "${INSTALLER}"
+          df -h "${DATA_ROOT}" || true
 
-      - name: Upload Single-File Installer
+      - name: Upload Single-File Installer (Artifact)
+        continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
-          name: Sonic-the-Hedgehog-2006-CachyOS-${{ inputs.build_type }}-${{ github.run_number }}
-          path: Sonic-the-Hedgehog-2006-CachyOS-installer.run
+          name: Sonic-2006-CachyOS-FULL-${{ inputs.build_type }}-${{ github.run_number }}
+          path: |
+            ${{ steps.dataroot.outputs.path }}/${{ env.INSTALLER_NAME }}
+            ${{ steps.dataroot.outputs.path }}/SHA256SUMS.txt
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 14
+          compression-level: 0
+
+      - name: Prepare Release Assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "${DATA_ROOT}"
+          ASSETS="${DATA_ROOT}/release_assets"
+          rm -rf "${ASSETS}"
+          mkdir -p "${ASSETS}"
+
+          SIZE="$(stat -c%s "${INSTALLER_NAME}")"
+          SIZE_H="$(numfmt --to=iec "${SIZE}")"
+          LIMIT="1992294400"   # 1900 MiB; GitHub release assets must stay below 2 GiB
+          SPLIT="0"
+
+          if [ "${SIZE}" -le "${LIMIT}" ]; then
+            echo "Installer fits in a single release asset (${SIZE_H})."
+            cp "${INSTALLER_NAME}" "${ASSETS}/"
+            cp SHA256SUMS.txt "${ASSETS}/"
+          else
+            SPLIT="1"
+            echo "Installer is ${SIZE_H}; splitting into 1900 MiB parts."
+            split -b 1900M -d -a 2 "${INSTALLER_NAME}" "${ASSETS}/${INSTALLER_NAME}.part"
+            cp SHA256SUMS.txt "${ASSETS}/"
+            ( cd "${ASSETS}" && sha256sum "${INSTALLER_NAME}".part* > SHA256SUMS.parts )
+
+            cat > "${ASSETS}/join-and-install.sh" <<'JOIN'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          cd "$(dirname -- "${BASH_SOURCE[0]}")"
+          BASE="Sonic-the-Hedgehog-2006-CachyOS-FULL-installer.run"
+          if [ -f SHA256SUMS.parts ]; then
+            echo "Verifying part checksums..."
+            sha256sum -c SHA256SUMS.parts
+          fi
+          echo "Joining parts..."
+          cat "${BASE}".part* > "${BASE}"
+          chmod 0755 "${BASE}"
+          echo "Created: ${BASE}"
+          exec "./${BASE}" "$@"
+          JOIN
+            chmod 0755 "${ASSETS}/join-and-install.sh"
+
+            cat > "${ASSETS}/README-parts.txt" <<'NOTE'
+          These files are 1900 MiB parts of the single-file installer:
+
+            Sonic-the-Hedgehog-2006-CachyOS-FULL-installer.run
+
+          Download ALL *.part* files plus join-and-install.sh and
+          SHA256SUMS.parts into the SAME folder, then run:
+
+            chmod +x join-and-install.sh
+            ./join-and-install.sh
+
+          Manual alternative:
+
+            cat Sonic-the-Hedgehog-2006-CachyOS-FULL-installer.run.part* \
+              > Sonic-the-Hedgehog-2006-CachyOS-FULL-installer.run
+            chmod +x Sonic-the-Hedgehog-2006-CachyOS-FULL-installer.run
+            ./Sonic-the-Hedgehog-2006-CachyOS-FULL-installer.run
+          NOTE
+
+            rm -f "${INSTALLER_NAME}"
+          fi
+
+          cat > "${DATA_ROOT}/release_body.md" <<BODY
+          # Sonic the Hedgehog (2006) - MarathonRecomp (CachyOS/Linux)
+
+          ## FULL single-file release - the complete game is included
+
+          One self-extracting file containing the MarathonRecomp Linux executable
+          and the complete extracted Xbox 360 game filesystem:
+
+              ${INSTALLER_NAME}
+
+          Size: ${SIZE_H}
+
+          ### Install
+
+              chmod +x ${INSTALLER_NAME}
+              ./${INSTALLER_NAME}
+
+          Default install location: ~/.local/share/MarathonRecomp
+
+          Custom location:
+
+              ./${INSTALLER_NAME} ~/Games/Sonic2006
+
+          Non-interactive overwrite:
+
+              SONIC_YES=1 ./${INSTALLER_NAME}
+
+          ### Requirements (CachyOS/Arch)
+
+              sudo pacman -S --needed gtk3 alsa-lib libpulse pipewire mesa vulkan-icd-loader
+
+          ### Wayland note
+
+              ~/.local/share/MarathonRecomp/run-sonic.sh --sdl-video-driver wayland
+              ~/.local/share/MarathonRecomp/run-sonic.sh --sdl-video-driver x11
+          BODY
+
+          if [ "${SPLIT}" = "1" ]; then
+            cat >> "${DATA_ROOT}/release_body.md" <<BODY
+
+          ### Split parts
+
+          GitHub limits each release file to 2 GiB, so this installer is split
+          into 1900 MiB parts. Download ALL *.part* files plus join-and-install.sh
+          and SHA256SUMS.parts into one folder and run:
+
+              chmod +x join-and-install.sh
+              ./join-and-install.sh
+
+          Manual join:
+
+              cat ${INSTALLER_NAME}.part* > ${INSTALLER_NAME}
+              chmod +x ${INSTALLER_NAME}
+              ./${INSTALLER_NAME}
+          BODY
+          fi
+
+          ls -lh "${ASSETS}"
 
       - name: Release to GitHub
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: "sonic-cachyos-${{ inputs.build_type }}-${{ github.run_number }}"
-          name: "Sonic CachyOS ${{ inputs.build_type }} #${{ github.run_number }}"
-          files: Sonic-the-Hedgehog-2006-CachyOS-installer.run
-          body: |
-            # Sonic the Hedgehog (2006)
-            ## Marathon Recompiled — CachyOS/Linux
-
-            This release contains a single-file Linux installer.
-
-            The installer includes the MarathonRecomp executable and XISO extractor.
-            Original Sonic the Hedgehog game assets are not included.
-
-            During installation, provide your own legally obtained Xbox 360 ISO/XISO.
-            The installer extracts the game filesystem to:
-
-              ~/.local/share/MarathonRecomp/game
+          tag_name: "sonic-cachyos-full-${{ inputs.build_type }}-${{ github.run_number }}"
+          name: "Sonic CachyOS FULL ${{ inputs.build_type }} #${{ github.run_number }}"
+          files: ${{ steps.dataroot.outputs.path }}/release_assets/*
+          body_path: ${{ steps.dataroot.outputs.path }}/release_body.md
