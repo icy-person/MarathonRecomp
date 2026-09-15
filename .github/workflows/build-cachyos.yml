@@ -40,15 +40,6 @@ jobs:
             gtk3 alsa-lib libpulse pipewire pkgconf p7zip \
             curl zip unzip tar file binutils ca-certificates zlib
           update-ca-trust
-          echo "Installed tool versions:"
-          git --version
-          cmake --version
-          ninja --version
-          clang --version
-          llvm-ar --version
-          llvm-ranlib --version
-          7z
-          echo "Required executables:"
           command -v git
           command -v cmake
           command -v ninja
@@ -60,6 +51,8 @@ jobs:
           command -v unzip
           command -v tar
           command -v 7z
+          llvm-ar --version
+          llvm-ranlib --version
 
       - name: Checkout MarathonRecomp
         uses: actions/checkout@v4
@@ -76,13 +69,8 @@ jobs:
           cmake -S /tmp/extract-xiso -B /tmp/extract-xiso/build -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build /tmp/extract-xiso/build --parallel "$(nproc)"
           EXTRACT_XISO_BIN="$(find /tmp/extract-xiso/build -type f -name 'extract-xiso' -perm -111 -print -quit)"
-          if [[ -z "${EXTRACT_XISO_BIN}" ]]; then
-            echo "ERROR: extract-xiso executable was not produced."
-            find /tmp/extract-xiso/build -maxdepth 3 -type f -print
-            exit 1
-          fi
+          [[ -n "${EXTRACT_XISO_BIN}" ]] || { echo "ERROR: extract-xiso executable was not produced."; exit 1; }
           install -Dm755 "${EXTRACT_XISO_BIN}" /usr/local/bin/extract-xiso
-          ls -lh /usr/local/bin/extract-xiso
           extract-xiso -h
 
       - name: Validate Download Configuration
@@ -92,7 +80,6 @@ jobs:
           [[ -n "${BASE_URL:-}" ]] || { echo "ERROR: SONIC_BASE_URL secret is not configured."; exit 1; }
           [[ -n "${ARCHIVE_PREFIX:-}" ]] || { echo "ERROR: SONIC_ARCHIVE_PREFIX secret is not configured."; exit 1; }
           [[ -n "${ARCHIVE_PASSWORD:-}" ]] || { echo "ERROR: SONIC_ARCHIVE_PASSWORD secret is not configured."; exit 1; }
-          echo "Archive configuration is configured."
 
       - name: Download Sonic Xbox 360 Release
         shell: bash
@@ -118,10 +105,9 @@ jobs:
             FILE="sonic_raw/${ARCHIVE_PREFIX}.part${i}.rar"
             [[ -s "${FILE}" ]] || { echo "ERROR: Empty file: ${FILE}"; exit 1; }
             MAGIC="$(dd if="${FILE}" bs=1 count=7 2>/dev/null | od -An -tx1 | tr -d ' \n')"
-            echo "part${i}: magic=${MAGIC}"
             case "${MAGIC}" in
               526172211a0700|526172211a070100) ;;
-              *) file "${FILE}"; exit 1 ;;
+              *) echo "ERROR: Invalid RAR signature: ${FILE}"; file "${FILE}"; exit 1 ;;
             esac
           done
 
@@ -133,7 +119,6 @@ jobs:
           mkdir -p extracted_assets
           FIRST_PART="sonic_raw/${ARCHIVE_PREFIX}.part1.rar"
           7z x "${FIRST_PART}" "-oextracted_assets" "-p${ARCHIVE_PASSWORD}" -y
-          du -sh extracted_assets
           find extracted_assets -maxdepth 4 -type f -print > extracted_listing.txt
           sed -n '1,200p' extracted_listing.txt
 
@@ -142,8 +127,7 @@ jobs:
         run: |
           set -euo pipefail
           ISO_FILE="$(find extracted_assets -type f \( -iname '*.iso' -o -iname '*.xiso' \) -print -quit)"
-          echo "ISO_FILE=${ISO_FILE:-NOT FOUND}"
-          [[ -n "${ISO_FILE}" && -s "${ISO_FILE}" ]] || { echo "ERROR: No usable ISO/XISO image was found."; find extracted_assets -type f -print; exit 1; }
+          [[ -n "${ISO_FILE}" && -s "${ISO_FILE}" ]] || { echo "ERROR: No usable ISO/XISO image was found."; exit 1; }
           ls -lh "${ISO_FILE}"
           file "${ISO_FILE}"
           printf 'ISO_FILE=%s\n' "${ISO_FILE}" >> "${GITHUB_ENV}"
@@ -196,16 +180,13 @@ jobs:
           install -m 0644 "${DEFAULT_XEX}" MarathonRecompLib/private/default.xex
           install -m 0644 "${SHADER_ARC}" MarathonRecompLib/private/shader.arc
           install -m 0644 "${SHADER_LT_ARC}" MarathonRecompLib/private/shader_lt.arc
-          ls -lh MarathonRecompLib/private
 
       - name: Cleanup Downloaded Archives
         shell: bash
         run: |
           set -euo pipefail
           rm -rf sonic_raw
-          if [[ -n "${ISO_FILE:-}" && -f "${ISO_FILE}" ]]; then rm -f "${ISO_FILE}"; fi
-          du -sh . || true
-          ls -lh MarathonRecompLib/private
+          rm -f "${ISO_FILE}"
 
       - name: Bootstrap vcpkg
         shell: bash
@@ -213,8 +194,8 @@ jobs:
           set -euo pipefail
           export VCPKG_ROOT="${GITHUB_WORKSPACE}/thirdparty/vcpkg"
           export VCPKG_DISABLE_METRICS=1
-          [[ -d "${VCPKG_ROOT}" ]] || { echo "ERROR: VCPKG_ROOT directory does not exist."; exit 1; }
-          [[ -f "${VCPKG_ROOT}/bootstrap-vcpkg.sh" ]] || { echo "ERROR: bootstrap-vcpkg.sh was not found."; exit 1; }
+          [[ -d "${VCPKG_ROOT}" ]] || exit 1
+          [[ -f "${VCPKG_ROOT}/bootstrap-vcpkg.sh" ]] || exit 1
           command -v cmake
           command -v ninja
           command -v git
@@ -225,32 +206,22 @@ jobs:
           cd "${VCPKG_ROOT}"
           chmod +x bootstrap-vcpkg.sh
           ./bootstrap-vcpkg.sh -disableMetrics
-          [[ -x "${VCPKG_ROOT}/vcpkg" ]] || { echo "ERROR: vcpkg executable was not produced."; exit 1; }
+          [[ -x "${VCPKG_ROOT}/vcpkg" ]] || exit 1
           "${VCPKG_ROOT}/vcpkg" version
 
       - name: Configure CMake
         shell: bash
         env:
           VCPKG_ROOT: ${{ github.workspace }}/thirdparty/vcpkg
-          CMAKE_AR: /usr/bin/llvm-ar
-          CMAKE_RANLIB: /usr/bin/llvm-ranlib
-          CMAKE_C_COMPILER_AR: /usr/bin/llvm-ar
-          CMAKE_C_COMPILER_RANLIB: /usr/bin/llvm-ranlib
-          CMAKE_CXX_COMPILER_AR: /usr/bin/llvm-ar
-          CMAKE_CXX_COMPILER_RANLIB: /usr/bin/llvm-ranlib
         run: |
           set -euo pipefail
           PRESET="${{ inputs.build_type }}"
-          echo "Using CMake preset: ${PRESET}"
           command -v cmake
           command -v ninja
           command -v clang
           command -v llvm-ar
           command -v llvm-ranlib
-          cmake --version
-          ninja --version
           test -x "${VCPKG_ROOT}/vcpkg"
-          "${VCPKG_ROOT}/vcpkg" version
           cmake --preset "${PRESET}" \
             -DCMAKE_AR=/usr/bin/llvm-ar \
             -DCMAKE_RANLIB=/usr/bin/llvm-ranlib \
@@ -265,7 +236,7 @@ jobs:
           set -euo pipefail
           PRESET="${{ inputs.build_type }}"
           BUILD_DIR="./out/build/${PRESET}"
-          [[ -d "${BUILD_DIR}" ]] || { echo "ERROR: CMake build directory does not exist: ${BUILD_DIR}"; exit 1; }
+          [[ -d "${BUILD_DIR}" ]] || exit 1
           cmake --build "${BUILD_DIR}" --target MarathonRecomp --parallel "$(nproc)"
 
       - name: Verify Linux Binary
@@ -275,49 +246,155 @@ jobs:
           BIN="./out/build/${{ inputs.build_type }}/MarathonRecomp/MarathonRecomp"
           [[ -f "${BIN}" ]] || { echo "ERROR: MarathonRecomp binary was not produced."; exit 1; }
           chmod +x "${BIN}"
-          ls -lh "${BIN}"
           file "${BIN}"
           readelf -h "${BIN}" | sed -n '1,25p'
           ldd "${BIN}" || true
-          stat -c '%A %a %n' "${BIN}"
 
-      - name: Package CachyOS Build
+      - name: Build Single-File Installer
         shell: bash
         run: |
           set -euo pipefail
-          PACKAGE_DIR="Sonic-the-Hedgehog-2006-CachyOS"
-          rm -rf "${PACKAGE_DIR}"
-          mkdir -p "${PACKAGE_DIR}"
+
+          STAGE="installer_stage"
+          WORK="installer_work"
+          INSTALLER="Sonic-the-Hedgehog-2006-CachyOS-installer.run"
           BIN="./out/build/${{ inputs.build_type }}/MarathonRecomp/MarathonRecomp"
-          cp "${BIN}" "${PACKAGE_DIR}/MarathonRecomp"
-          chmod +x "${PACKAGE_DIR}/MarathonRecomp"
-          cat > "${PACKAGE_DIR}/run-sonic.sh" <<'EOF'
+
+          rm -rf "${STAGE}" "${WORK}" "${INSTALLER}"
+          mkdir -p "${STAGE}/payload" "${WORK}"
+
+          install -m 0755 "${BIN}" "${STAGE}/payload/MarathonRecomp"
+          install -m 0755 /usr/local/bin/extract-xiso "${STAGE}/payload/extract-xiso"
+
+          cat > "${STAGE}/payload/install.sh" <<'INSTALL_SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+          PREFIX="${HOME}/.local/share/MarathonRecomp"
+          BIN_DIR="${HOME}/.local/bin"
+          DESKTOP_DIR="${HOME}/.local/share/applications"
+
+          echo "Sonic the Hedgehog (2006) - MarathonRecomp"
+          echo
+          echo "Installation directory: ${PREFIX}"
+          echo
+
+          ISO="${1:-}"
+          if [[ -z "${ISO}" ]]; then
+            read -r -p "Path to your legally obtained Xbox 360 ISO/XISO: " ISO
+          fi
+
+          [[ -n "${ISO}" ]] || { echo "ERROR: No ISO path supplied."; exit 1; }
+          [[ -f "${ISO}" ]] || { echo "ERROR: ISO file not found: ${ISO}"; exit 1; }
+
+          rm -rf "${PREFIX}"
+          mkdir -p "${PREFIX}/game" "${BIN_DIR}" "${DESKTOP_DIR}"
+
+          install -m 0755 "${SCRIPT_DIR}/MarathonRecomp" "${PREFIX}/MarathonRecomp"
+          install -m 0755 "${SCRIPT_DIR}/extract-xiso" "${PREFIX}/extract-xiso"
+
+          echo
+          echo "Extracting the game filesystem from your ISO..."
+          "${PREFIX}/extract-xiso" "${ISO}" -d "${PREFIX}/game"
+
+          [[ -f "${PREFIX}/game/default.xex" ]] || {
+            echo "ERROR: default.xex was not found after ISO extraction."
+            rm -rf "${PREFIX}"
+            exit 1
+          }
+
+          cat > "${PREFIX}/run-sonic.sh" <<'LAUNCHER'
           #!/usr/bin/env bash
           set -euo pipefail
           SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
           cd "${SCRIPT_DIR}"
           exec "./MarathonRecomp" "$@"
-          EOF
-          chmod +x "${PACKAGE_DIR}/run-sonic.sh"
-          touch "${PACKAGE_DIR}/portable.txt"
-          cat > "${PACKAGE_DIR}/README.txt" <<'EOF'
-          Sonic the Hedgehog (2006)
-          Marathon Recompiled - CachyOS/Linux
+          LAUNCHER
+          chmod +x "${PREFIX}/run-sonic.sh"
 
-          Run:
-              ./run-sonic.sh
+          ln -sfn "${PREFIX}/MarathonRecomp" "${BIN_DIR}/MarathonRecomp"
 
-          The public package contains the MarathonRecomp executable only.
-          Original game assets are not included.
-          EOF
-          tar -czf "Sonic-the-Hedgehog-2006-CachyOS.tar.gz" "${PACKAGE_DIR}"
-          ls -lh "Sonic-the-Hedgehog-2006-CachyOS.tar.gz"
+          cat > "${DESKTOP_DIR}/MarathonRecomp.desktop" <<DESKTOP
+          [Desktop Entry]
+          Type=Application
+          Name=Sonic the Hedgehog (2006) - MarathonRecomp
+          Comment=Sonic the Hedgehog (2006) recompiled for Linux
+          Exec=${PREFIX}/MarathonRecomp
+          Path=${PREFIX}
+          Terminal=false
+          Categories=Game;
+          DESKTOP
 
-      - name: Upload Linux Build Artifact
+          echo
+          echo "Installation complete."
+          echo "Game files: ${PREFIX}/game"
+          echo "Launcher: ${PREFIX}/run-sonic.sh"
+          echo "Desktop entry: ${DESKTOP_DIR}/MarathonRecomp.desktop"
+          echo
+          echo "Starting the game..."
+          exec "${PREFIX}/MarathonRecomp"
+          INSTALL_SCRIPT
+
+          chmod +x "${STAGE}/payload/install.sh"
+
+          cat > "${STAGE}/README.txt" <<'README'
+          Sonic the Hedgehog (2006) - MarathonRecomp for CachyOS/Linux
+
+          This is a single-file installer.
+
+          Usage:
+            ./Sonic-the-Hedgehog-2006-CachyOS-installer.run
+
+          The installer contains the Linux executable and XISO extractor.
+          It does NOT contain original Sonic the Hedgehog game assets.
+
+          During installation, provide the path to your own legally obtained
+          Xbox 360 ISO/XISO image. The installer extracts the complete game
+          filesystem into:
+
+            ~/.local/share/MarathonRecomp/game
+
+          The launcher is installed at:
+
+            ~/.local/share/MarathonRecomp/run-sonic.sh
+          README
+
+          cp "${STAGE}/README.txt" "${WORK}/README.txt"
+          cp "${STAGE}/payload"/* "${WORK}/"
+
+          cat > "${WORK}/stub" <<'STUB'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          PAYLOAD_LINE=__PAYLOAD_LINE__
+          SELF="$(readlink -f "$0")"
+          TMP="$(mktemp -d)"
+          cleanup() { rm -rf "${TMP}"; }
+          trap cleanup EXIT
+
+          tail -n +"${PAYLOAD_LINE}" "${SELF}" | tar -xzf - -C "${TMP}"
+          exec "${TMP}/install.sh" "$@"
+          STUB
+
+          PAYLOAD_LINE="$(grep -n '^__PAYLOAD__$' "${WORK}/stub" | cut -d: -f1)"
+          (( PAYLOAD_LINE > 0 )) || { echo "ERROR: payload marker missing"; exit 1; }
+          PAYLOAD_LINE=$((PAYLOAD_LINE + 1))
+
+          sed "s/^PAYLOAD_LINE=.*/PAYLOAD_LINE=${PAYLOAD_LINE}/" "${WORK}/stub" > "${INSTALLER}"
+          printf '\n__PAYLOAD__\n' >> "${INSTALLER}"
+          tar -czf - -C "${WORK}" install.sh MarathonRecomp extract-xiso README.txt >> "${INSTALLER}"
+          chmod +x "${INSTALLER}"
+
+          echo "Single-file installer created:"
+          ls -lh "${INSTALLER}"
+          file "${INSTALLER}"
+
+      - name: Upload Single-File Installer
         uses: actions/upload-artifact@v4
         with:
           name: Sonic-the-Hedgehog-2006-CachyOS-${{ inputs.build_type }}-${{ github.run_number }}
-          path: Sonic-the-Hedgehog-2006-CachyOS.tar.gz
+          path: Sonic-the-Hedgehog-2006-CachyOS-installer.run
           if-no-files-found: error
           retention-days: 30
 
@@ -326,15 +403,17 @@ jobs:
         with:
           tag_name: "sonic-cachyos-${{ inputs.build_type }}-${{ github.run_number }}"
           name: "Sonic CachyOS ${{ inputs.build_type }} #${{ github.run_number }}"
-          files: Sonic-the-Hedgehog-2006-CachyOS.tar.gz
+          files: Sonic-the-Hedgehog-2006-CachyOS-installer.run
           body: |
             # Sonic the Hedgehog (2006)
             ## Marathon Recompiled — CachyOS/Linux
 
-            Automated Linux build from MarathonRecomp.
+            This release contains a single-file Linux installer.
 
-            **Build:** `${{ inputs.build_type }}`
-            **Target:** Arch Linux / CachyOS
-            **Runner:** Arch Linux container
+            The installer includes the MarathonRecomp executable and XISO extractor.
+            Original Sonic the Hedgehog game assets are not included.
 
-            Original game assets are not included in the public release.
+            During installation, provide your own legally obtained Xbox 360 ISO/XISO.
+            The installer extracts the game filesystem to:
+
+              ~/.local/share/MarathonRecomp/game
