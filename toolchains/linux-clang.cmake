@@ -32,7 +32,20 @@ if(NOT _VCPKG_LINUX_CLANG_TOOLCHAIN)
     # Set compiler to clang
     set(CMAKE_C_COMPILER clang)
     set(CMAKE_CXX_COMPILER clang++)
-    SET(CMAKE_ASM_COMPILER clang)
+    set(CMAKE_ASM_COMPILER clang)
+
+    # Explicitly select LLVM archiver tools.
+    # CMake's compiler discovery may otherwise leave these as NOTFOUND when
+    # clang is used from an Arch/LLVM environment.
+    find_program(LLVM_AR llvm-ar REQUIRED)
+    find_program(LLVM_RANLIB llvm-ranlib REQUIRED)
+
+    set(CMAKE_AR "${LLVM_AR}" CACHE FILEPATH "LLVM archiver" FORCE)
+    set(CMAKE_RANLIB "${LLVM_RANLIB}" CACHE FILEPATH "LLVM ranlib" FORCE)
+    set(CMAKE_C_COMPILER_AR "${LLVM_AR}" CACHE FILEPATH "LLVM C compiler archiver" FORCE)
+    set(CMAKE_C_COMPILER_RANLIB "${LLVM_RANLIB}" CACHE FILEPATH "LLVM C compiler ranlib" FORCE)
+    set(CMAKE_CXX_COMPILER_AR "${LLVM_AR}" CACHE FILEPATH "LLVM CXX compiler archiver" FORCE)
+    set(CMAKE_CXX_COMPILER_RANLIB "${LLVM_RANLIB}" CACHE FILEPATH "LLVM CXX compiler ranlib" FORCE)
 
     # Pick target architecture for clang
     if(VCPKG_TARGET_ARCHITECTURE STREQUAL "x64")
