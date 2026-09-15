@@ -1,0 +1,488 @@
+name: Build and Release Sonic CachyOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: CMake build configuration
+        required: true
+        default: linux-release
+        type: choice
+        options:
+          - linux-release
+          - linux-relwithdebinfo
+          - linux-debug
+
+permissions:
+  contents: write
+
+env:
+  BASE_URL: "https://pdn.sharezilla.ir/d/console"
+  ARCHIVE_PREFIX: "Sonic.the.Hedgehog.XBOX360.PAL.DNL_p30download.com"
+  ARCHIVE_PASSWORD: "www.p30download.com"
+
+jobs:
+  build:
+    name: Build & Release Sonic
+    runs-on: ubuntu-24.04
+
+    container:
+      image: archlinux:latest
+
+    steps:
+
+      # =========================================================
+      # 1. Dependencies
+      # =========================================================
+      - name: Install Dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          pacman -Syu --noconfirm
+
+          pacman -S --needed --noconfirm \
+            base-devel \
+            git \
+            cmake \
+            ninja \
+            clang \
+            lld \
+            gtk3 \
+            alsa-lib \
+            libpulse \
+            pipewire \
+            pkgconf \
+            p7zip \
+            wget \
+            curl \
+            file \
+            binutils \
+            ca-certificates
+
+      # =========================================================
+      # 2. Checkout repository
+      # =========================================================
+      - name: Checkout MarathonRecomp
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      # =========================================================
+      # 3. Download all RAR parts
+      # =========================================================
+      - name: Download Sonic Xbox 360 Release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p sonic_raw
+
+          for i in $(seq 1 8); do
+            FILE="${ARCHIVE_PREFIX}.part${i}.rar"
+            URL="${BASE_URL}/${FILE}"
+            OUTPUT="sonic_raw/${FILE}"
+
+            echo
+            echo "================================================="
+            echo "Downloading part ${i}/8"
+            echo "${URL}"
+            echo "================================================="
+
+            curl \
+              --fail \
+              --location \
+              --retry 8 \
+              --retry-delay 5 \
+              --connect-timeout 30 \
+              --max-time 1800 \
+              --continue-at - \
+              -o "${OUTPUT}" \
+              "${URL}"
+
+            test -s "${OUTPUT}"
+
+            echo "Downloaded:"
+            ls -lh "${OUTPUT}"
+          done
+
+      # =========================================================
+      # 4. Validate downloaded files
+      # =========================================================
+      - name: Validate RAR Parts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking RAR signatures..."
+
+          for i in $(seq 1 8); do
+            FILE="sonic_raw/${ARCHIVE_PREFIX}.part${i}.rar"
+
+            if [[ ! -s "${FILE}" ]]; then
+              echo "ERROR: Empty file: ${FILE}"
+              exit 1
+            fi
+
+            MAGIC="$(head -c 7 "${FILE}" | od -An -tx1 | tr -d ' \n')"
+
+            echo "part${i}: magic=${MAGIC}"
+
+            case "${MAGIC}" in
+              526172211a0700|526172211a070100)
+                echo "  valid RAR signature"
+                ;;
+              *)
+                echo "ERROR: ${FILE} does not look like a RAR archive."
+                echo "The server may have returned an HTML error page."
+                file "${FILE}"
+                exit 1
+                ;;
+            esac
+          done
+
+      # =========================================================
+      # 5. Extract archive
+      # =========================================================
+      - name: Extract Sonic Release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf extracted_assets
+          mkdir -p extracted_assets
+
+          FIRST_PART="sonic_raw/${ARCHIVE_PREFIX}.part1.rar"
+
+          echo "Extracting multi-part RAR..."
+          echo "Source: ${FIRST_PART}"
+
+          7z x \
+            "${FIRST_PART}" \
+            "-oextracted_assets" \
+            "-p${ARCHIVE_PASSWORD}" \
+            -y
+
+          echo
+          echo "Extraction complete."
+
+          du -sh extracted_assets
+          find extracted_assets -maxdepth 3 -type f | head -100
+
+      # =========================================================
+      # 6. Locate required MarathonRecomp files
+      # =========================================================
+      - name: Locate Game Files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Searching for required files..."
+
+          DEFAULT_XEX="$(find extracted_assets -type f -iname 'default.xex' -print -quit)"
+          SHADER_ARC="$(find extracted_assets -type f -iname 'shader.arc' -print -quit)"
+          SHADER_LT_ARC="$(find extracted_assets -type f -iname 'shader_lt.arc' -print -quit)"
+
+          echo "default.xex   = ${DEFAULT_XEX:-NOT FOUND}"
+          echo "shader.arc    = ${SHADER_ARC:-NOT FOUND}"
+          echo "shader_lt.arc = ${SHADER_LT_ARC:-NOT FOUND}"
+
+          [[ -n "${DEFAULT_XEX}" ]] || {
+            echo "ERROR: default.xex not found."
+            exit 1
+          }
+
+          [[ -n "${SHADER_ARC}" ]] || {
+            echo "ERROR: shader.arc not found."
+            exit 1
+          }
+
+          [[ -n "${SHADER_LT_ARC}" ]] || {
+            echo "ERROR: shader_lt.arc not found."
+            exit 1
+          }
+
+          {
+            echo "DEFAULT_XEX=${DEFAULT_XEX}"
+            echo "SHADER_ARC=${SHADER_ARC}"
+            echo "SHADER_LT_ARC=${SHADER_LT_ARC}"
+          } >> "${GITHUB_ENV}"
+
+      # =========================================================
+      # 7. Prepare MarathonRecomp private files
+      # =========================================================
+      - name: Prepare MarathonRecomp Game Data
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p MarathonRecompLib/private
+
+          install -m 0644 \
+            "${DEFAULT_XEX}" \
+            MarathonRecompLib/private/default.xex
+
+          install -m 0644 \
+            "${SHADER_ARC}" \
+            MarathonRecompLib/private/shader.arc
+
+          install -m 0644 \
+            "${SHADER_LT_ARC}" \
+            MarathonRecompLib/private/shader_lt.arc
+
+          echo
+          echo "Prepared private game files:"
+          ls -lh MarathonRecompLib/private
+
+      # =========================================================
+      # 8. Configure using official project preset
+      # =========================================================
+      - name: Configure CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PRESET="${{ inputs.build_type }}"
+
+          echo "Using CMake preset: ${PRESET}"
+
+          cmake . \
+            --preset "${PRESET}" \
+            -DSDL2MIXER_VORBIS=VORBISFILE
+
+      # =========================================================
+      # 9. Build
+      # =========================================================
+      - name: Build MarathonRecomp
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PRESET="${{ inputs.build_type }}"
+          BUILD_DIR="./out/build/${PRESET}"
+
+          cmake --build \
+            "${BUILD_DIR}" \
+            --target MarathonRecomp \
+            --parallel "$(nproc)"
+
+      # =========================================================
+      # 10. Verify binary
+      # =========================================================
+      - name: Verify Linux Binary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BIN="./out/build/${{ inputs.build_type }}/MarathonRecomp/MarathonRecomp"
+
+          if [[ ! -f "${BIN}" ]]; then
+            echo "ERROR: MarathonRecomp binary was not produced."
+            exit 1
+          fi
+
+          chmod +x "${BIN}"
+
+          echo
+          echo "Binary:"
+          ls -lh "${BIN}"
+
+          echo
+          echo "File information:"
+          file "${BIN}"
+
+          echo
+          echo "ELF information:"
+          readelf -h "${BIN}" | head -25
+
+          echo
+          echo "Dynamic dependencies:"
+          ldd "${BIN}" || true
+
+      # =========================================================
+      # 11. Create runnable CachyOS package
+      # =========================================================
+      - name: Package CachyOS Build
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PACKAGE_DIR="Sonic-the-Hedgehog-2006-CachyOS"
+
+          rm -rf "${PACKAGE_DIR}"
+          mkdir -p "${PACKAGE_DIR}"
+
+          BIN="./out/build/${{ inputs.build_type }}/MarathonRecomp/MarathonRecomp"
+
+          cp "${BIN}" \
+            "${PACKAGE_DIR}/MarathonRecomp"
+
+          # -----------------------------------------------------
+          # Launcher
+          # -----------------------------------------------------
+          cat > "${PACKAGE_DIR}/run-sonic.sh" <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+          cd "${SCRIPT_DIR}"
+
+          if [[ ! -x "./MarathonRecomp" ]]; then
+            echo "ERROR: MarathonRecomp binary not found."
+            exit 1
+          fi
+
+          exec "./MarathonRecomp" \
+            --sdl-video-driver wayland \
+            "$@"
+          EOF
+
+          chmod +x "${PACKAGE_DIR}/run-sonic.sh"
+
+          # -----------------------------------------------------
+          # README
+          # -----------------------------------------------------
+          cat > "${PACKAGE_DIR}/README.txt" <<'EOF'
+          Sonic the Hedgehog (2006)
+          Marathon Recompiled - CachyOS/Linux
+
+          Run:
+
+              ./run-sonic.sh
+
+          Wayland is selected automatically.
+
+          For X11:
+
+              ./MarathonRecomp --sdl-video-driver x11
+
+          Configuration:
+
+              ~/.config/MarathonRecomp/
+
+          Save data:
+
+              ~/.config/MarathonRecomp/save/
+          EOF
+
+          echo
+          echo "Package contents:"
+          find "${PACKAGE_DIR}" -maxdepth 2 -type f -printf '%p\n'
+
+      # =========================================================
+      # 12. Create private full package containing game files
+      # =========================================================
+      - name: Package Full Private Build
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FULL_DIR="Sonic-the-Hedgehog-2006-CachyOS-Full"
+
+          rm -rf "${FULL_DIR}"
+          mkdir -p "${FULL_DIR}/game"
+
+          # Executable
+          cp \
+            "Sonic-the-Hedgehog-2006-CachyOS/MarathonRecomp" \
+            "${FULL_DIR}/MarathonRecomp"
+
+          # Launcher
+          cp \
+            "Sonic-the-Hedgehog-2006-CachyOS/run-sonic.sh" \
+            "${FULL_DIR}/run-sonic.sh"
+
+          # README
+          cp \
+            "Sonic-the-Hedgehog-2006-CachyOS/README.txt" \
+            "${FULL_DIR}/README.txt"
+
+          # Game data
+          cp \
+            MarathonRecompLib/private/default.xex \
+            "${FULL_DIR}/game/default.xex"
+
+          cp \
+            MarathonRecompLib/private/shader.arc \
+            "${FULL_DIR}/game/shader.arc"
+
+          cp \
+            MarathonRecompLib/private/shader_lt.arc \
+            "${FULL_DIR}/game/shader_lt.arc"
+
+          chmod +x "${FULL_DIR}/MarathonRecomp"
+          chmod +x "${FULL_DIR}/run-sonic.sh"
+
+          echo "Full private package:"
+          find "${FULL_DIR}" -maxdepth 2 -type f -exec ls -lh {} \;
+
+          tar -czf \
+            "Sonic-the-Hedgehog-2006-CachyOS-Full.tar.gz" \
+            "${FULL_DIR}"
+
+      # =========================================================
+      # 13. Public package
+      # =========================================================
+      - name: Create Public Release Package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tar -czf \
+            "Sonic-the-Hedgehog-2006-CachyOS.tar.gz" \
+            "Sonic-the-Hedgehog-2006-CachyOS"
+
+          ls -lh \
+            "Sonic-the-Hedgehog-2006-CachyOS.tar.gz"
+
+      # =========================================================
+      # 14. Upload private full build as workflow artifact
+      # =========================================================
+      - name: Upload Full Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sonic-the-Hedgehog-2006-CachyOS-Full-${{ github.run_number }}
+          path: Sonic-the-Hedgehog-2006-CachyOS-Full.tar.gz
+          retention-days: 7
+
+      # =========================================================
+      # 15. Upload public build artifact
+      # =========================================================
+      - name: Upload Linux Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sonic-the-Hedgehog-2006-CachyOS-${{ inputs.build_type }}-${{ github.run_number }}
+          path: Sonic-the-Hedgehog-2006-CachyOS.tar.gz
+          retention-days: 30
+
+      # =========================================================
+      # 16. GitHub Release
+      # =========================================================
+      - name: Release to GitHub
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "sonic-cachyos-${{ inputs.build_type }}-${{ github.run_number }}"
+          name: "Sonic CachyOS ${{ inputs.build_type }} #${{ github.run_number }}"
+          files: |
+            Sonic-the-Hedgehog-2006-CachyOS.tar.gz
+          body: |
+            # Sonic the Hedgehog (2006)
+            ## Marathon Recompiled — CachyOS/Linux
+
+            Automated Linux build from MarathonRecomp.
+
+            **Build:** `${{ inputs.build_type }}`
+            **Target:** Arch Linux / CachyOS
+            **Runner:** Arch Linux container
+
+            Included:
+
+            - MarathonRecomp Linux executable
+            - Wayland launcher
+            - README
+
+            Game assets are not included in the public GitHub Release.
+            The complete build containing the supplied game files is
+            available only as the private workflow artifact produced by
+            this run.
