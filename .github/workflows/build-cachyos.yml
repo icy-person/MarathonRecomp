@@ -1,0 +1,120 @@
+name: Build CachyOS Linux
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: CMake build configuration
+        required: true
+        default: linux-release
+        type: choice
+        options:
+          - linux-release
+          - linux-relwithdebinfo
+          - linux-debug
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cachyos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: CachyOS-compatible Linux (${{ inputs.build_type }})
+    runs-on: ubuntu-24.04
+    container:
+      image: archlinux:latest
+
+    env:
+      CMAKE_PRESET: ${{ inputs.build_type }}
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --needed --noconfirm \
+            base-devel git cmake ninja clang lld \
+            gtk3 alsa-lib libpulse pipewire
+
+      - name: Checkout MarathonRecomp
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Checkout private game assets
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ secrets.ASSET_REPO }}
+          token: ${{ secrets.ASSET_REPO_TOKEN }}
+          path: private
+
+      - name: Validate required Xbox 360 files
+        shell: bash
+        run: |
+          set -euo pipefail
+          required=(
+            default.xex
+            shader.arc
+            shader_lt.arc
+          )
+
+          for file in "${required[@]}"; do
+            if [[ ! -f "private/$file" ]]; then
+              echo "ERROR: missing private/$file"
+              exit 1
+            fi
+          done
+
+          echo "Xbox 360 source files found:"
+          ls -lh private/default.xex private/shader.arc private/shader_lt.arc
+
+      - name: Prepare MarathonRecomp game files
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -Dm644 private/default.xex MarathonRecompLib/private/default.xex
+          install -Dm644 private/shader.arc MarathonRecompLib/private/shader.arc
+          install -Dm644 private/shader_lt.arc MarathonRecompLib/private/shader_lt.arc
+
+      - name: Configure
+        run: |
+          cmake . --preset "${CMAKE_PRESET}" \
+            -DSDL2MIXER_VORBIS=VORBISFILE
+
+      - name: Build
+        run: |
+          cmake --build "./out/build/${CMAKE_PRESET}" \
+            --target MarathonRecomp \
+            --parallel "$(nproc)"
+
+      - name: Verify executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="./out/build/${CMAKE_PRESET}/MarathonRecomp/MarathonRecomp"
+          test -x "$bin"
+          file "$bin"
+          ldd "$bin" || true
+
+      - name: Package CachyOS build
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release/MarathonRecomp
+          cp "./out/build/${CMAKE_PRESET}/MarathonRecomp/MarathonRecomp" release/MarathonRecomp/
+          printf '%s\n' \
+            "MarathonRecomp CachyOS/Linux build" \
+            "Commit: $GITHUB_SHA" \
+            "Preset: $CMAKE_PRESET" \
+            "Built in Arch Linux container for Arch/CachyOS compatibility" \
+            > release/MarathonRecomp/BUILD-INFO.txt
+          tar -C release -czf "MarathonRecomp-CachyOS-${CMAKE_PRESET}.tar.gz" MarathonRecomp
+
+      - name: Upload CachyOS artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: MarathonRecomp-CachyOS-${{ inputs.build_type }}
+          path: MarathonRecomp-CachyOS-${{ inputs.build_type }}.tar.gz
+          if-no-files-found: error
