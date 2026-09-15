@@ -47,7 +47,7 @@ jobs:
 
     steps:
 
-      # =========================================================
+        # =========================================================
       # 1. Dependencies
       # =========================================================
       - name: Install Dependencies
@@ -80,11 +80,23 @@ jobs:
 
           echo
           echo "Installed tool versions:"
+
           git --version
-          cmake --version | head -1
+
+          CMAKE_VERSION="$(cmake --version)"
+          printf '%s\n' "${CMAKE_VERSION}"
+
           ninja --version
-          clang --version | head -1
-          7z i | head -15
+
+          CLANG_VERSION="$(clang --version)"
+          printf '%s\n' "${CLANG_VERSION}"
+
+          echo
+          echo "7-Zip version:"
+          7z
+
+          echo
+          echo "Dependency installation completed successfully."
 
       # =========================================================
       # 2. Checkout repository
