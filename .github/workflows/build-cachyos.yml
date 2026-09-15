@@ -16,10 +16,26 @@ on:
 permissions:
   contents: write
 
+# =============================================================
+# IMPORTANT:
+# Set these three values as GitHub Repository Secrets:
+#
+# SONIC_BASE_URL
+# SONIC_ARCHIVE_PREFIX
+# SONIC_ARCHIVE_PASSWORD
+#
+# Example:
+# SONIC_BASE_URL       = https://your-authorized-mirror.example/path
+# SONIC_ARCHIVE_PREFIX = Sonic.the.Hedgehog.XBOX360.PAL
+# SONIC_ARCHIVE_PASSWORD = your-password
+#
+# The workflow keeps the same BASE_URL / ARCHIVE_PREFIX /
+# ARCHIVE_PASSWORD interface as the original workflow.
+# =============================================================
 env:
-  BASE_URL: "https://pdn.sharezilla.ir/d/console"
-  ARCHIVE_PREFIX: "Sonic.the.Hedgehog.XBOX360.PAL.DNL_p30download.com"
-  ARCHIVE_PASSWORD: "www.p30download.com"
+  BASE_URL: ${{ secrets.SONIC_BASE_URL }}
+  ARCHIVE_PREFIX: ${{ secrets.SONIC_ARCHIVE_PREFIX }}
+  ARCHIVE_PASSWORD: ${{ secrets.SONIC_ARCHIVE_PASSWORD }}
 
 jobs:
   build:
@@ -54,14 +70,21 @@ jobs:
             pipewire \
             pkgconf \
             p7zip \
-            wget \
             curl \
             file \
             binutils \
-            ca-certificates
+            ca-certificates \
+            zlib
 
+          update-ca-trust
 
-            update-ca-trust
+          echo
+          echo "Installed tool versions:"
+          git --version
+          cmake --version | head -1
+          ninja --version
+          clang --version | head -1
+          7z i | head -15
 
       # =========================================================
       # 2. Checkout repository
@@ -73,7 +96,98 @@ jobs:
           fetch-depth: 1
 
       # =========================================================
-      # 3. Download all RAR parts
+      # 3. Build extract-xiso
+      # =========================================================
+      - name: Build extract-xiso
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf /tmp/extract-xiso
+
+          echo "Cloning XboxDev/extract-xiso..."
+
+          git clone \
+            --depth 1 \
+            https://github.com/XboxDev/extract-xiso.git \
+            /tmp/extract-xiso
+
+          echo
+          echo "Configuring extract-xiso..."
+
+          cmake \
+            -S /tmp/extract-xiso \
+            -B /tmp/extract-xiso/build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release
+
+          echo
+          echo "Building extract-xiso..."
+
+          cmake \
+            --build /tmp/extract-xiso/build \
+            --parallel "$(nproc)"
+
+          EXTRACT_XISO_BIN="$(
+            find /tmp/extract-xiso/build \
+              -type f \
+              -name 'extract-xiso' \
+              -perm -111 \
+              -print \
+              -quit
+          )"
+
+          if [[ -z "${EXTRACT_XISO_BIN}" ]]; then
+            echo "ERROR: extract-xiso executable was not produced."
+            echo
+            echo "Build directory:"
+            find /tmp/extract-xiso/build -maxdepth 3 -type f -print
+            exit 1
+          fi
+
+          install -Dm755 \
+            "${EXTRACT_XISO_BIN}" \
+            /usr/local/bin/extract-xiso
+
+          echo
+          echo "extract-xiso installed:"
+          ls -lh /usr/local/bin/extract-xiso
+
+          echo
+          echo "extract-xiso version:"
+          extract-xiso -v
+
+      # =========================================================
+      # 4. Validate download configuration
+      # =========================================================
+      - name: Validate Download Configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking archive configuration..."
+
+          if [[ -z "${BASE_URL:-}" ]]; then
+            echo "ERROR: SONIC_BASE_URL secret is not configured."
+            exit 1
+          fi
+
+          if [[ -z "${ARCHIVE_PREFIX:-}" ]]; then
+            echo "ERROR: SONIC_ARCHIVE_PREFIX secret is not configured."
+            exit 1
+          fi
+
+          if [[ -z "${ARCHIVE_PASSWORD:-}" ]]; then
+            echo "ERROR: SONIC_ARCHIVE_PASSWORD secret is not configured."
+            exit 1
+          fi
+
+          echo "BASE_URL is configured."
+          echo "ARCHIVE_PREFIX is configured."
+          echo "ARCHIVE_PASSWORD is configured."
+
+      # =========================================================
+      # 5. Download all RAR parts
       # =========================================================
       - name: Download Sonic Xbox 360 Release
         shell: bash
@@ -84,34 +198,38 @@ jobs:
 
           for i in $(seq 1 8); do
             FILE="${ARCHIVE_PREFIX}.part${i}.rar"
-            URL="${BASE_URL}/${FILE}"
+            URL="${BASE_URL%/}/${FILE}"
             OUTPUT="sonic_raw/${FILE}"
 
             echo
             echo "================================================="
             echo "Downloading part ${i}/8"
-            echo "${URL}"
             echo "================================================="
 
             curl \
               --fail \
               --location \
               --retry 8 \
+              --retry-all-errors \
               --retry-delay 5 \
               --connect-timeout 30 \
               --max-time 1800 \
               --continue-at - \
-              -o "${OUTPUT}" \
+              --output "${OUTPUT}" \
               "${URL}"
 
-            test -s "${OUTPUT}"
+            if [[ ! -s "${OUTPUT}" ]]; then
+              echo "ERROR: Downloaded file is empty:"
+              echo "${OUTPUT}"
+              exit 1
+            fi
 
             echo "Downloaded:"
             ls -lh "${OUTPUT}"
           done
 
       # =========================================================
-      # 4. Validate downloaded files
+      # 6. Validate downloaded files
       # =========================================================
       - name: Validate RAR Parts
         shell: bash
@@ -128,7 +246,11 @@ jobs:
               exit 1
             fi
 
-            MAGIC="$(head -c 7 "${FILE}" | od -An -tx1 | tr -d ' \n')"
+            MAGIC="$(
+              head -c 7 "${FILE}" |
+              od -An -tx1 |
+              tr -d ' \n'
+            )"
 
             echo "part${i}: magic=${MAGIC}"
 
@@ -138,15 +260,20 @@ jobs:
                 ;;
               *)
                 echo "ERROR: ${FILE} does not look like a RAR archive."
-                echo "The server may have returned an HTML error page."
+                echo
+                echo "The server may have returned an HTML/error page."
+                echo
                 file "${FILE}"
                 exit 1
                 ;;
             esac
           done
 
+          echo
+          echo "All RAR signatures are valid."
+
       # =========================================================
-      # 5. Extract archive
+      # 7. Extract archive
       # =========================================================
       - name: Extract Sonic Release
         shell: bash
@@ -157,6 +284,12 @@ jobs:
           mkdir -p extracted_assets
 
           FIRST_PART="sonic_raw/${ARCHIVE_PREFIX}.part1.rar"
+
+          if [[ ! -f "${FIRST_PART}" ]]; then
+            echo "ERROR: First RAR volume not found:"
+            echo "${FIRST_PART}"
+            exit 1
+          fi
 
           echo "Extracting multi-part RAR..."
           echo "Source: ${FIRST_PART}"
@@ -170,41 +303,203 @@ jobs:
           echo
           echo "Extraction complete."
 
+          echo
+          echo "Extracted size:"
           du -sh extracted_assets
-          find extracted_assets -maxdepth 3 -type f | head -100
+
+          echo
+          echo "Top-level extracted files:"
+          find extracted_assets \
+            -maxdepth 4 \
+            -type f \
+            -print > extracted_listing.txt
+
+          sed -n '1,200p' extracted_listing.txt
 
       # =========================================================
-      # 6. Locate required MarathonRecomp files
+      # 8. Locate Xbox 360 ISO
+      # =========================================================
+      - name: Locate Xbox 360 ISO
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Searching for Xbox 360 ISO..."
+
+          ISO_FILE="$(
+            find extracted_assets \
+              -type f \
+              \( \
+                -iname '*.iso' \
+                -o \
+                -iname '*.xiso' \
+              \) \
+              -print \
+              -quit
+          )"
+
+          echo "ISO_FILE=${ISO_FILE:-NOT FOUND}"
+
+          if [[ -z "${ISO_FILE}" ]]; then
+            echo "ERROR: No ISO/XISO image was found after RAR extraction."
+            echo
+            echo "Available files:"
+            find extracted_assets -type f -print
+            exit 1
+          fi
+
+          if [[ ! -s "${ISO_FILE}" ]]; then
+            echo "ERROR: ISO file is empty:"
+            echo "${ISO_FILE}"
+            exit 1
+          fi
+
+          echo
+          echo "ISO information:"
+          ls -lh "${ISO_FILE}"
+          file "${ISO_FILE}"
+
+          echo
+          echo "Saving ISO path..."
+
+          printf 'ISO_FILE=%s\n' "${ISO_FILE}" >> "${GITHUB_ENV}"
+
+      # =========================================================
+      # 9. Inspect Xbox 360 XISO
+      # =========================================================
+      - name: Inspect Xbox 360 XISO
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Listing XISO contents..."
+
+          extract-xiso \
+            -l "${ISO_FILE}" \
+            > xiso_contents.txt
+
+          echo
+          echo "XISO contents:"
+          sed -n '1,250p' xiso_contents.txt
+
+          echo
+          echo "Checking for required Xbox 360 game files..."
+
+          if ! grep -Eiq 'default\.xex' xiso_contents.txt; then
+            echo "WARNING: default.xex was not found in the XISO listing."
+          fi
+
+          if ! grep -Eiq 'shader\.arc' xiso_contents.txt; then
+            echo "WARNING: shader.arc was not found in the XISO listing."
+          fi
+
+          if ! grep -Eiq 'shader_lt\.arc' xiso_contents.txt; then
+            echo "WARNING: shader_lt.arc was not found in the XISO listing."
+          fi
+
+      # =========================================================
+      # 10. Extract Xbox 360 filesystem from ISO
+      # =========================================================
+      - name: Extract Xbox 360 Filesystem
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf xbox360_game
+          mkdir -p xbox360_game
+
+          echo "Extracting XISO filesystem..."
+          echo "Source:"
+          echo "${ISO_FILE}"
+
+          extract-xiso \
+            "${ISO_FILE}" \
+            -d xbox360_game
+
+          echo
+          echo "XISO extraction complete."
+
+          echo
+          echo "Extracted Xbox 360 filesystem size:"
+          du -sh xbox360_game
+
+          echo
+          echo "Xbox 360 filesystem files:"
+
+          find xbox360_game \
+            -type f \
+            -print > xbox360_listing.txt
+
+          sed -n '1,250p' xbox360_listing.txt
+
+      # =========================================================
+      # 11. Locate required MarathonRecomp files
       # =========================================================
       - name: Locate Game Files
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Searching for required files..."
+          echo "Searching inside extracted Xbox 360 filesystem..."
+          echo
 
-          DEFAULT_XEX="$(find extracted_assets -type f -iname 'default.xex' -print -quit)"
-          SHADER_ARC="$(find extracted_assets -type f -iname 'shader.arc' -print -quit)"
-          SHADER_LT_ARC="$(find extracted_assets -type f -iname 'shader_lt.arc' -print -quit)"
+          DEFAULT_XEX="$(
+            find xbox360_game \
+              -type f \
+              -iname 'default.xex' \
+              -print \
+              -quit
+          )"
+
+          SHADER_ARC="$(
+            find xbox360_game \
+              -type f \
+              -iname 'shader.arc' \
+              -print \
+              -quit
+          )"
+
+          SHADER_LT_ARC="$(
+            find xbox360_game \
+              -type f \
+              -iname 'shader_lt.arc' \
+              -print \
+              -quit
+          )"
 
           echo "default.xex   = ${DEFAULT_XEX:-NOT FOUND}"
           echo "shader.arc    = ${SHADER_ARC:-NOT FOUND}"
           echo "shader_lt.arc = ${SHADER_LT_ARC:-NOT FOUND}"
 
+          echo
+
           [[ -n "${DEFAULT_XEX}" ]] || {
-            echo "ERROR: default.xex not found."
+            echo "ERROR: default.xex not found inside extracted Xbox 360 filesystem."
+            echo
+            echo "Searching for similarly named files:"
+            find xbox360_game \
+              -type f \
+              \( \
+                -iname '*default*xex*' \
+                -o \
+                -iname '*shader*arc*' \
+              \) \
+              -print
             exit 1
           }
 
           [[ -n "${SHADER_ARC}" ]] || {
-            echo "ERROR: shader.arc not found."
+            echo "ERROR: shader.arc not found inside extracted Xbox 360 filesystem."
             exit 1
           }
 
           [[ -n "${SHADER_LT_ARC}" ]] || {
-            echo "ERROR: shader_lt.arc not found."
+            echo "ERROR: shader_lt.arc not found inside extracted Xbox 360 filesystem."
             exit 1
           }
+
+          echo
+          echo "All required MarathonRecomp inputs were found."
 
           {
             echo "DEFAULT_XEX=${DEFAULT_XEX}"
@@ -213,7 +508,7 @@ jobs:
           } >> "${GITHUB_ENV}"
 
       # =========================================================
-      # 7. Prepare MarathonRecomp private files
+      # 12. Prepare MarathonRecomp private files
       # =========================================================
       - name: Prepare MarathonRecomp Game Data
         shell: bash
@@ -222,13 +517,19 @@ jobs:
 
           mkdir -p MarathonRecompLib/private
 
+          echo "Copying default.xex..."
+
           install -m 0644 \
             "${DEFAULT_XEX}" \
             MarathonRecompLib/private/default.xex
 
+          echo "Copying shader.arc..."
+
           install -m 0644 \
             "${SHADER_ARC}" \
             MarathonRecompLib/private/shader.arc
+
+          echo "Copying shader_lt.arc..."
 
           install -m 0644 \
             "${SHADER_LT_ARC}" \
@@ -238,8 +539,41 @@ jobs:
           echo "Prepared private game files:"
           ls -lh MarathonRecompLib/private
 
+          echo
+          echo "Sizes:"
+          du -h \
+            MarathonRecompLib/private/default.xex \
+            MarathonRecompLib/private/shader.arc \
+            MarathonRecompLib/private/shader_lt.arc
+
       # =========================================================
-      # 8. Configure using official project preset
+      # 13. Cleanup large source archives / ISO
+      # =========================================================
+      - name: Cleanup Downloaded Archives
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Removing downloaded RAR volumes..."
+
+          rm -rf sonic_raw
+
+          echo "Removing extracted ISO..."
+
+          if [[ -n "${ISO_FILE:-}" && -f "${ISO_FILE}" ]]; then
+            rm -f "${ISO_FILE}"
+          fi
+
+          echo
+          echo "Workspace usage after cleanup:"
+          du -sh . || true
+
+          echo
+          echo "Required build inputs still present:"
+          ls -lh MarathonRecompLib/private
+
+      # =========================================================
+      # 14. Configure using official project preset
       # =========================================================
       - name: Configure CMake
         shell: bash
@@ -248,14 +582,21 @@ jobs:
 
           PRESET="${{ inputs.build_type }}"
 
-          echo "Using CMake preset: ${PRESET}"
+          echo "Using CMake preset:"
+          echo "${PRESET}"
+
+          echo
+          echo "Available CMake presets:"
+          cmake --list-presets
+
+          echo
+          echo "Configuring..."
 
           cmake . \
-            --preset "${PRESET}" \
-            -DSDL2MIXER_VORBIS=VORBISFILE
+            --preset "${PRESET}"
 
       # =========================================================
-      # 9. Build
+      # 15. Build
       # =========================================================
       - name: Build MarathonRecomp
         shell: bash
@@ -265,13 +606,22 @@ jobs:
           PRESET="${{ inputs.build_type }}"
           BUILD_DIR="./out/build/${PRESET}"
 
+          echo "Build directory:"
+          echo "${BUILD_DIR}"
+
+          if [[ ! -d "${BUILD_DIR}" ]]; then
+            echo "ERROR: CMake build directory does not exist:"
+            echo "${BUILD_DIR}"
+            exit 1
+          fi
+
           cmake --build \
             "${BUILD_DIR}" \
             --target MarathonRecomp \
             --parallel "$(nproc)"
 
       # =========================================================
-      # 10. Verify binary
+      # 16. Verify Linux Binary
       # =========================================================
       - name: Verify Linux Binary
         shell: bash
@@ -282,6 +632,12 @@ jobs:
 
           if [[ ! -f "${BIN}" ]]; then
             echo "ERROR: MarathonRecomp binary was not produced."
+            echo
+            echo "Searching build output:"
+            find "./out/build/${{ inputs.build_type }}" \
+              -type f \
+              -maxdepth 6 \
+              -print
             exit 1
           fi
 
@@ -297,14 +653,18 @@ jobs:
 
           echo
           echo "ELF information:"
-          readelf -h "${BIN}" | head -25
+          readelf -h "${BIN}" | sed -n '1,25p'
 
           echo
           echo "Dynamic dependencies:"
           ldd "${BIN}" || true
 
+          echo
+          echo "Executable permission:"
+          stat -c '%A %a %n' "${BIN}"
+
       # =========================================================
-      # 11. Create runnable CachyOS package
+      # 17. Create runnable CachyOS package
       # =========================================================
       - name: Package CachyOS Build
         shell: bash
@@ -319,6 +679,9 @@ jobs:
           BIN="./out/build/${{ inputs.build_type }}/MarathonRecomp/MarathonRecomp"
 
           cp "${BIN}" \
+            "${PACKAGE_DIR}/MarathonRecomp"
+
+          chmod +x \
             "${PACKAGE_DIR}/MarathonRecomp"
 
           # -----------------------------------------------------
@@ -336,12 +699,17 @@ jobs:
             exit 1
           fi
 
-          exec "./MarathonRecomp" \
-            --sdl-video-driver wayland \
-            "$@"
+          exec "./MarathonRecomp" "$@"
           EOF
 
-          chmod +x "${PACKAGE_DIR}/run-sonic.sh"
+          chmod +x \
+            "${PACKAGE_DIR}/run-sonic.sh"
+
+          # -----------------------------------------------------
+          # Portable mode
+          # -----------------------------------------------------
+          touch \
+            "${PACKAGE_DIR}/portable.txt"
 
           # -----------------------------------------------------
           # README
@@ -354,9 +722,15 @@ jobs:
 
               ./run-sonic.sh
 
-          Wayland is selected automatically.
+          Or directly:
 
-          For X11:
+              ./MarathonRecomp
+
+          Wayland:
+
+              ./MarathonRecomp --sdl-video-driver wayland
+
+          X11:
 
               ./MarathonRecomp --sdl-video-driver x11
 
@@ -367,14 +741,31 @@ jobs:
           Save data:
 
               ~/.config/MarathonRecomp/save/
+
+          portable.txt:
+
+              Creating portable.txt forces configuration/save data
+              to be stored in the installation directory.
+
+          NOTE:
+
+              This package contains the MarathonRecomp executable
+              only. Original game assets are not included here.
           EOF
 
           echo
           echo "Package contents:"
-          find "${PACKAGE_DIR}" -maxdepth 2 -type f -printf '%p\n'
+          find "${PACKAGE_DIR}" \
+            -maxdepth 2 \
+            -type f \
+            -printf '%p\n'
+
+          echo
+          echo "Package size:"
+          du -sh "${PACKAGE_DIR}"
 
       # =========================================================
-      # 12. Create private full package containing game files
+      # 18. Create private full package containing game files
       # =========================================================
       - name: Package Full Private Build
         shell: bash
@@ -386,22 +777,37 @@ jobs:
           rm -rf "${FULL_DIR}"
           mkdir -p "${FULL_DIR}/game"
 
+          # -----------------------------------------------------
           # Executable
+          # -----------------------------------------------------
           cp \
             "Sonic-the-Hedgehog-2006-CachyOS/MarathonRecomp" \
             "${FULL_DIR}/MarathonRecomp"
 
+          # -----------------------------------------------------
           # Launcher
+          # -----------------------------------------------------
           cp \
             "Sonic-the-Hedgehog-2006-CachyOS/run-sonic.sh" \
             "${FULL_DIR}/run-sonic.sh"
 
+          # -----------------------------------------------------
+          # Portable mode
+          # -----------------------------------------------------
+          cp \
+            "Sonic-the-Hedgehog-2006-CachyOS/portable.txt" \
+            "${FULL_DIR}/portable.txt"
+
+          # -----------------------------------------------------
           # README
+          # -----------------------------------------------------
           cp \
             "Sonic-the-Hedgehog-2006-CachyOS/README.txt" \
             "${FULL_DIR}/README.txt"
 
-          # Game data
+          # -----------------------------------------------------
+          # Game data required by this build
+          # -----------------------------------------------------
           cp \
             MarathonRecompLib/private/default.xex \
             "${FULL_DIR}/game/default.xex"
@@ -414,53 +820,81 @@ jobs:
             MarathonRecompLib/private/shader_lt.arc \
             "${FULL_DIR}/game/shader_lt.arc"
 
-          chmod +x "${FULL_DIR}/MarathonRecomp"
-          chmod +x "${FULL_DIR}/run-sonic.sh"
+          chmod +x \
+            "${FULL_DIR}/MarathonRecomp"
 
+          chmod +x \
+            "${FULL_DIR}/run-sonic.sh"
+
+          echo
           echo "Full private package:"
-          find "${FULL_DIR}" -maxdepth 2 -type f -exec ls -lh {} \;
+          find "${FULL_DIR}" \
+            -maxdepth 2 \
+            -type f \
+            -exec ls -lh {} \;
 
-          tar -czf \
+          echo
+          echo "Full private package size:"
+          du -sh "${FULL_DIR}"
+
+          tar \
+            -czf \
             "Sonic-the-Hedgehog-2006-CachyOS-Full.tar.gz" \
             "${FULL_DIR}"
 
+          echo
+          echo "Created:"
+          ls -lh \
+            "Sonic-the-Hedgehog-2006-CachyOS-Full.tar.gz"
+
       # =========================================================
-      # 13. Public package
+      # 19. Public package
       # =========================================================
       - name: Create Public Release Package
         shell: bash
         run: |
           set -euo pipefail
 
-          tar -czf \
+          tar \
+            -czf \
             "Sonic-the-Hedgehog-2006-CachyOS.tar.gz" \
             "Sonic-the-Hedgehog-2006-CachyOS"
 
+          echo
+          echo "Public package:"
           ls -lh \
             "Sonic-the-Hedgehog-2006-CachyOS.tar.gz"
 
+          echo
+          echo "Public package contents:"
+          tar \
+            -tzf \
+            "Sonic-the-Hedgehog-2006-CachyOS.tar.gz"
+
       # =========================================================
-      # 14. Upload private full build as workflow artifact
+      # 20. Upload private full build as workflow artifact
       # =========================================================
       - name: Upload Full Build Artifact
         uses: actions/upload-artifact@v4
         with:
           name: Sonic-the-Hedgehog-2006-CachyOS-Full-${{ github.run_number }}
           path: Sonic-the-Hedgehog-2006-CachyOS-Full.tar.gz
+          if-no-files-found: error
           retention-days: 7
 
       # =========================================================
-      # 15. Upload public build artifact
+      # 21. Upload public build artifact
       # =========================================================
       - name: Upload Linux Build Artifact
         uses: actions/upload-artifact@v4
         with:
           name: Sonic-the-Hedgehog-2006-CachyOS-${{ inputs.build_type }}-${{ github.run_number }}
           path: Sonic-the-Hedgehog-2006-CachyOS.tar.gz
+          if-no-files-found: error
           retention-days: 30
 
       # =========================================================
-      # 16. GitHub Release
+      # 22. GitHub Release
       # =========================================================
       - name: Release to GitHub
         uses: softprops/action-gh-release@v2
@@ -479,13 +913,17 @@ jobs:
             **Target:** Arch Linux / CachyOS
             **Runner:** Arch Linux container
 
-            Included:
+            Included in the public release:
 
             - MarathonRecomp Linux executable
-            - Wayland launcher
+            - Wayland/X11 launcher
+            - portable.txt
             - README
 
-            Game assets are not included in the public GitHub Release.
-            The complete build containing the supplied game files is
-            available only as the private workflow artifact produced by
-            this run.
+            Original game assets are not included in the public
+            GitHub Release.
+
+            The workflow also produces a separate private workflow
+            artifact containing the game files supplied to the build.
+
+            
