@@ -24,7 +24,7 @@ env:
 jobs:
   build:
     name: Build & Release Sonic
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
 
     container:
       image: archlinux:latest
@@ -64,6 +64,7 @@ jobs:
       # 2. Checkout repository
       # =========================================================
       - name: Checkout MarathonRecomp
+        shell: bash
         uses: actions/checkout@v4
         with:
           submodules: recursive
